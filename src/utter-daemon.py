@@ -8,7 +8,7 @@ An idle socket gets a KeepAlive every KEEPALIVE_S (Deepgram closes one after ~10
 every REFRESH_S. Signals: SIGUSR1 starts/stops a dictation, SIGHUP re-reads the API key, SIGUSR2 opens the window.
 Runs as the systemd user service `utter`; the `utter` command sends the signals.
 """
-import array, asyncio, json, math, os, signal, subprocess, time
+import array, ast, asyncio, json, math, os, shutil, signal, subprocess, time
 
 import websockets
 
@@ -318,11 +318,83 @@ def keep(text: str) -> None:
 
 
 POPUP = None
+HOTKEY = "<Alt>d"
+GNOME_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
+UTTER_KEY_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/utter/"
+
+
+def save_setting(key: str, value) -> None:
+    cfg = {}
+    try:
+        with open(SETTINGS) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    cfg[key] = value
+    os.makedirs(CONFIG, mode=0o700, exist_ok=True)
+    tmp = SETTINGS + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write(json.dumps(cfg))
+    os.replace(tmp, SETTINGS)
+
+
+def gset(*args) -> str:
+    return subprocess.run(["gsettings", *args], capture_output=True, text=True, timeout=5).stdout.strip()
+
+
+def ensure_hotkey() -> None:
+    """First run on GNOME: bind Alt+D to `utter`, unless Utter already has a shortcut or Alt+D is taken.
+    Runs once per user; change it later in Settings > Keyboard > Custom Shortcuts."""
+    try:
+        with open(SETTINGS) as f:
+            if json.load(f).get("hotkey_checked"):
+                return
+    except (OSError, ValueError):
+        pass
+    try:
+        if not shutil.which("gsettings") or GNOME_KEYS not in gset("list-schemas"):
+            save_setting("hotkey_checked", True)
+            return
+        raw = gset("get", GNOME_KEYS, "custom-keybindings")
+        if not raw.startswith(("[", "@as [")):
+            return  # could not read the list: never overwrite the user's shortcuts with a guess
+        paths = ast.literal_eval(raw.removeprefix("@as "))
+        for path in paths:
+            command = gset("get", f"{GNOME_KEYS}.custom-keybinding:{path}", "command").strip("'")
+            binding = gset("get", f"{GNOME_KEYS}.custom-keybinding:{path}", "binding").strip("'")
+            if os.path.basename(command.split()[0] if command else "") == "utter":
+                save_setting("hotkey_checked", True)
+                return  # already bound
+            if binding.lower() == HOTKEY.lower():
+                notify("Alt+D is already used by another shortcut. Bind any key to the command 'utter' in "
+                       "Settings > Keyboard > Custom Shortcuts.")
+                save_setting("hotkey_checked", True)
+                return
+        # the service's PATH often lacks ~/.local/bin, so look where the two installs put the command
+        command = next((c for c in (shutil.which("utter"), os.path.expanduser("~/.local/bin/utter"), "/usr/bin/utter")
+                        if c and os.access(c, os.X_OK)), None)
+        if command is None:
+            LOG("no 'utter' command found to bind")
+            return
+        node = f"{GNOME_KEYS}.custom-keybinding:{UTTER_KEY_PATH}"
+        gset("set", node, "name", "Utter: start or stop dictation")
+        gset("set", node, "command", command)
+        gset("set", node, "binding", HOTKEY)
+        if UTTER_KEY_PATH not in paths:
+            gset("set", GNOME_KEYS, "custom-keybindings", str(paths + [UTTER_KEY_PATH]))
+        notify("Press Alt+D to start dictating, and again to stop.")
+        save_setting("hotkey_checked", True)
+        LOG("bound Alt+D")
+    except (OSError, ValueError, SyntaxError, subprocess.TimeoutExpired) as exc:
+        LOG(f"could not set up the shortcut: {exc}")
 
 
 async def main() -> None:
     global POPUP
     POPUP = Popup()
+    ensure_hotkey()
+    if not KEY:
+        POPUP.open("keys")  # first run: ask for the Deepgram key straight away
     toggle = asyncio.Event()
     asyncio.get_running_loop().add_signal_handler(signal.SIGUSR1, toggle.set)
     asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, reload_key)

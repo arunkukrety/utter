@@ -16,7 +16,17 @@ Speech-to-text runs on [Deepgram](https://deepgram.com) (`nova-3`), so you need 
 
 ## Install
 
-Tested on Ubuntu with GNOME on Wayland. Other desktops should work, but you'll bind the shortcut yourself.
+Tested on Ubuntu with GNOME on Wayland.
+
+**Ubuntu / Debian:** download the `.deb` from the [latest release](https://github.com/arunkukrety/utter/releases/latest) and install it:
+
+```bash
+sudo apt install ./utter_1.0.0_all.deb
+```
+
+Then open **Utter** from your apps. It asks for your Deepgram key, binds **Alt+D** (if nothing else uses it), and starts by itself at every login. If Alt+D is taken, a notice tells you; bind any key to the command `utter` in *Settings → Keyboard → Custom Shortcuts*.
+
+**Other distros, or without sudo:** install from source into your home folder:
 
 ```bash
 git clone https://github.com/arunkukrety/utter.git
@@ -24,14 +34,14 @@ cd utter
 ./install.sh
 ```
 
-The installer checks for the packages it needs and prints the `apt` line if any are missing. It asks for your Deepgram key, starts Utter as a user service and binds **Alt+D** on GNOME. To pick another shortcut, use `UTTER_HOTKEY='<Super>h' ./install.sh`, or `UTTER_HOTKEY=none` to skip it.
-
-The packages it uses, all from Ubuntu's own repositories:
+`install.sh` checks for what it needs and prints the install line if anything is missing. On Ubuntu that's:
 
 ```bash
 sudo apt install python3-websockets python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
   pulseaudio-utils ydotool wl-clipboard libnotify-bin
 ```
+
+To build the `.deb` yourself, run `packaging/build-deb.sh 1.0.0`.
 
 ## Use
 
@@ -58,9 +68,11 @@ sudo apt install python3-websockets python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappi
 ## Uninstall
 
 ```bash
-./uninstall.sh            # keeps your key, settings and History
-./uninstall.sh --purge    # removes those too
+sudo apt remove utter     # if you installed the .deb
+./uninstall.sh            # if you used install.sh (add --purge to also delete your key, settings and History)
 ```
+
+The `.deb` leaves your key, settings and History in `~/.config/utter` and `~/.local/share/utter`; delete those folders to remove them.
 
 ## How it works
 

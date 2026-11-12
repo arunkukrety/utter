@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # Installs Utter for the current user. No sudo needed unless packages are missing (it prints the apt line).
-#   ./install.sh                   install, ask for your Deepgram key, bind Alt+D on GNOME
-#   UTTER_HOTKEY='<Super>h' ./install.sh   bind a different shortcut (GNOME syntax)
-#   UTTER_HOTKEY=none ./install.sh         skip the shortcut
+#   ./install.sh    install, ask for your Deepgram key, start Utter (it binds Alt+D on GNOME if that key is free)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-HOTKEY="${UTTER_HOTKEY:-<Alt>d}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 APP="$DATA/utter/app"
@@ -77,29 +74,9 @@ systemctl --user daemon-reload
 systemctl --user enable utter.service >/dev/null 2>&1
 systemctl --user restart utter.service
 
-# ---- 6. keyboard shortcut (GNOME) ------------------------------------------------------------------------------------
-SCHEMA=org.gnome.settings-daemon.plugins.media-keys
-KPATH=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/utter/
-if [ "$HOTKEY" != none ] && gsettings list-keys "$SCHEMA" >/dev/null 2>&1; then
-  gsettings set "$SCHEMA.custom-keybinding:$KPATH" name 'Utter: start or stop dictation'
-  gsettings set "$SCHEMA.custom-keybinding:$KPATH" command "$BIN/utter"
-  gsettings set "$SCHEMA.custom-keybinding:$KPATH" binding "$HOTKEY"
-  list=$(gsettings get "$SCHEMA" custom-keybindings)
-  if [[ "$list" != *"$KPATH"* ]]; then
-    if [[ "$list" == "@as []" || "$list" == "[]" ]]; then list="['$KPATH']"; else list="${list%]}, '$KPATH']"; fi
-    gsettings set "$SCHEMA" custom-keybindings "$list"
-  fi
-  shortcut="$HOTKEY"
-else
-  shortcut=""
-fi
-
 echo
 say "Utter is installed and running."
-if [ -n "$shortcut" ]; then
-  echo "  Press $shortcut to start dictating, and again to stop."
-else
-  echo "  Bind a keyboard shortcut to: $BIN/utter"
-fi
+echo "  Press Alt+D to start dictating, and again to stop. (If Alt+D was taken, a notice says so: bind any key to"
+echo "  $BIN/utter in Settings > Keyboard > Custom Shortcuts.)"
 echo "  Open the window (history, API key, settings) from the microphone icon in the top bar, or run: utter settings"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "  Note: $BIN is not on your PATH, so call it as $BIN/utter" ;; esac

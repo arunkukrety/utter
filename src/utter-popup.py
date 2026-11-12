@@ -16,6 +16,12 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import GLib, Gtk, Gdk
 
+# one app identity, so the dock, window switcher and launcher all show Utter's own icon
+GLib.set_prgname("utter")
+GLib.set_application_name("Utter")
+Gdk.set_program_class("utter")
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 BARS = 5
 IN_MS, OUT_MS = 220, 180
 SLIDE_PX = 18         # how far it rises while fading in
@@ -50,7 +56,7 @@ note.set_no_show_all(True)
 box.pack_start(note, False, False, 0)
 win.add(box)
 
-state = {"level": 0.0, "shown": 0.0, "bars": [0.0] * BARS, "start": 0.0, "closing": None, "timer": None,
+state = {"history": [], "bars": [0.0] * BARS, "start": 0.0, "closing": None, "timer": None,
          "processing": None}  # monotonic time the loader started, or None while listening
 
 
@@ -76,12 +82,12 @@ def draw(_area, cr):
     if state["processing"] is not None:
         draw_loader(cr, time.monotonic() - state["processing"])
         return
-    # breathing red dot
-    pulse = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(now * 4.0))
-    cr.set_source_rgba(0.94, 0.27, 0.27, pulse)
+    # steady red recording dot
+    cr.set_source_rgba(0.94, 0.27, 0.27, 1.0)
     cr.arc(7, 11, 4.5, 0, 2 * math.pi)
     cr.fill()
-    # level bars: each bar follows the mic level with its own wobble, so speech looks alive and silence settles flat
+    # level bars: the middle bar is your voice right now, the outer ones a moment ago, so speech ripples outward
+    # and silence lies flat. Nothing here moves unless the mic hears something.
     cr.set_source_rgba(0.96, 0.96, 0.96, 0.9)
     for i, h in enumerate(state["bars"]):
         height = 3 + 16 * h
@@ -109,16 +115,11 @@ def place(offset: float) -> None:
 
 def tick() -> bool:
     now = time.monotonic()
-    # smooth the incoming level: fast attack, slow release
-    target = state["level"]
-    k = 0.5 if target > state["shown"] else 0.12
-    state["shown"] += (target - state["shown"]) * k
-    t = now - state["start"]
+    h = state["history"]  # newest level last
     for i in range(BARS):
-        wobble = 0.55 + 0.45 * math.sin(t * (7 + i * 1.7) + i * 1.3)
-        shape = (0.6, 0.85, 1.0, 0.85, 0.6)[i]
-        goal = min(1.0, state["shown"] * shape * wobble * 1.6)
-        state["bars"][i] += (goal - state["bars"][i]) * 0.35
+        age = abs(i - BARS // 2)  # 0 for the middle bar, 1 and 2 for the outer pairs
+        goal = h[-1 - age] if len(h) > age else 0.0
+        state["bars"][i] += (goal - state["bars"][i]) * 0.65  # ease toward it so 25 updates/s look smooth
     meter.queue_draw()
 
     if state["closing"] is None:
@@ -137,7 +138,7 @@ def tick() -> bool:
 
 
 def show() -> None:
-    state.update(level=0.0, shown=0.0, bars=[0.0] * BARS, start=time.monotonic(), closing=None, processing=None)
+    state.update(history=[], bars=[0.0] * BARS, start=time.monotonic(), closing=None, processing=None)
     note.hide()
     win.set_opacity(0)
     win.resize(1, 1)
@@ -174,7 +175,7 @@ def on_stdin(source, _cond):
             state["closing"] = time.monotonic()
     elif line.startswith("L "):
         try:
-            state["level"] = max(0.0, min(1.0, float(line[2:])))
+            state["history"] = (state["history"] + [max(0.0, min(1.0, float(line[2:])))])[-BARS:]
         except ValueError:
             pass
     return True
@@ -326,6 +327,59 @@ def settings_page() -> Gtk.Widget:
     live.connect("toggled", on_toggle)
     once.connect("toggled", on_toggle)
 
+    autostart = Gtk.CheckButton(label="Start Utter when I log in", margin_top=14)
+    autostart.set_active(read_settings().get("autostart") is not False)
+
+    def on_autostart(button):
+        cfg = read_settings()
+        cfg["autostart"] = button.get_active()
+        write_private(SETTINGS, json.dumps(cfg))  # read at the next login
+
+    autostart.connect("toggled", on_autostart)
+    autostart_note = Gtk.Label(label="When off, Utter starts the first time you press the shortcut instead.",
+                               xalign=0, wrap=True)
+    autostart_note.get_style_context().add_class("dim-label")
+
+    lang_title = Gtk.Label(xalign=0, margin_top=14)
+    lang_title.set_markup("<b>Language</b>")
+    english = Gtk.RadioButton.new_with_label(None, "English only")
+    mixed = Gtk.RadioButton.new_with_label_from_widget(english, "English + Hindi: follows you between the two")
+    (mixed if read_settings().get("language") == "multi" else english).set_active(True)
+
+    hindi_title = Gtk.Label(xalign=0, margin_top=14)
+    hindi_title.set_markup("<b>Hindi</b>")
+    roman = Gtk.RadioButton.new_with_label(None, "Roman Hinglish: kal meeting hai")
+    deva = Gtk.RadioButton.new_with_label_from_widget(roman, "Devanagari: कल meeting है")
+    (deva if read_settings().get("hindi") == "devanagari" else roman).set_active(True)
+    hindi_note = Gtk.Label(label="How Hindi words are written. English is always written as is.",
+                           xalign=0, wrap=True)
+    hindi_note.get_style_context().add_class("dim-label")
+
+    def on_hindi(button):
+        if button.get_active():
+            cfg = read_settings()
+            cfg["hindi"] = "devanagari" if button is deva else "roman"
+            write_private(SETTINGS, json.dumps(cfg))
+
+    roman.connect("toggled", on_hindi)
+    deva.connect("toggled", on_hindi)
+
+    def show_hindi(is_mixed: bool) -> None:  # the Hindi options only matter when Hindi is on
+        for w in (hindi_title, roman, deva, hindi_note):
+            w.set_sensitive(is_mixed)
+
+    def on_language(button):
+        if button.get_active():
+            cfg = read_settings()
+            cfg["language"] = "multi" if button is mixed else "en"
+            write_private(SETTINGS, json.dumps(cfg))
+            show_hindi(button is mixed)
+            os.kill(os.getppid(), signal.SIGHUP)  # the daemon reconnects in the new language within a few seconds
+
+    english.connect("toggled", on_language)
+    mixed.connect("toggled", on_language)
+    show_hindi(mixed.get_active())
+
     mic_title = Gtk.Label(xalign=0, margin_top=14)
     mic_title.set_markup("<b>Microphone</b>")
     mics = Gtk.ComboBoxText()
@@ -345,7 +399,8 @@ def settings_page() -> Gtk.Widget:
     mic_note = Gtk.Label(label="Takes effect on your next Alt+D. If the chosen mic is unplugged, the system default is used.",
                          xalign=0, wrap=True)
     mic_note.get_style_context().add_class("dim-label")
-    for w in (title, live, once, note, mic_title, mics, mic_note):
+    for w in (autostart, autostart_note, title, live, once, note, lang_title, english, mixed, hindi_title, roman, deva, hindi_note, mic_title,
+              mics, mic_note):
         page.pack_start(w, False, False, 0)
     page.mics = mics
     return page
@@ -434,7 +489,11 @@ def tray() -> None:
         from gi.repository import AyatanaAppIndicator3 as AI
     except (ValueError, ImportError):
         return  # no top-bar support: dictation still works
+    tray_icon = os.path.join(HERE, "utter-tray.svg")
     ind = AI.Indicator.new("utter", "audio-input-microphone-symbolic", AI.IndicatorCategory.APPLICATION_STATUS)
+    if os.path.exists(tray_icon):  # Utter's own mark in the top bar; the stock mic icon only if it is missing
+        ind.set_icon_theme_path(HERE)
+        ind.set_icon_full("utter-tray", "Utter")
     ind.set_title("Utter")
     menu = Gtk.Menu()
     for label, handler in (("Dictation history", show_history), ("Copy last dictation", copy_last),

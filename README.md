@@ -11,6 +11,8 @@
 - **Nothing gets lost.** Every dictation is also copied to the clipboard and saved to a local History, so if no text box had focus, just press Ctrl+V.
 - **Small and quiet.** A tiny pill at the bottom of the screen shows a recording dot, live voice bars and a soft chime. It uses about 45 MB of memory.
 - **Survives drops.** If the connection breaks mid-sentence it reconnects in about a second and carries on.
+- **English, or English + Hindi.** In mixed mode it follows you between the two mid-sentence with no switching, and
+  types Hindi as Roman Hinglish ("kal meeting hai") or Devanagari, your choice.
 
 Speech-to-text runs on [Deepgram](https://deepgram.com) (`nova-3`), so you need a Deepgram API key. New accounts get free credit.
 
@@ -52,7 +54,7 @@ To build the `.deb` yourself, run `packaging/build-deb.sh 1.0.0`.
 | `utter settings` | open the window: History, API keys, typing mode, microphone |
 | `utter quit` | stop Utter (the next `utter` or Alt+D starts it again) |
 
-**Settings** has the typing mode and the microphone. **API keys** checks a new key with Deepgram before saving it, and Utter switches to it without a restart.
+**Settings** has start at login, the typing mode, the language (English only, or English + Hindi) and the microphone. **API keys** checks a new key with Deepgram before saving it, and Utter switches to it without a restart.
 
 ## Privacy
 

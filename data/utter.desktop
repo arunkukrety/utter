@@ -8,3 +8,4 @@ Icon=utter
 Terminal=false
 Categories=Utility;Accessibility;
 Keywords=dictation;speech;voice;transcribe;stt;
+StartupWMClass=utter

@@ -12,6 +12,7 @@ case "${1:-toggle}" in
   *) echo "utter: unknown command '$1' (try: utter --help)" >&2; exit 2 ;;
 esac
 if ! systemctl --user is-active --quiet "$svc"; then
+  touch "${XDG_RUNTIME_DIR:-/tmp}/utter-started-by-hand"  # so it runs even with "Start at login" off
   systemctl --user start "$svc"
   sleep 2.5  # let it open its connection to Deepgram
 fi

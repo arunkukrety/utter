@@ -8,13 +8,14 @@ rm -rf "$ROOT"
 mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/lib/utter/sounds" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user" \
          "$ROOT/usr/share/applications" "$ROOT/usr/share/icons/hicolor/scalable/apps" "$ROOT/usr/share/doc/utter" dist
 
-install -m 644 src/utter-daemon.py src/utter-popup.py "$ROOT/usr/lib/utter/"
+install -m 644 src/utter-daemon.py src/utter-popup.py src/hinglish.py "$ROOT/usr/lib/utter/"
 install -m 644 sounds/start.wav sounds/stop.wav "$ROOT/usr/lib/utter/sounds/"
 install -m 755 bin/utter "$ROOT/usr/bin/utter"
 sed 's|%h/.local/share/utter/app/|/usr/lib/utter/|' data/utter.service > "$ROOT/usr/lib/systemd/user/utter.service"
 chmod 644 "$ROOT/usr/lib/systemd/user/utter.service"
 install -m 644 data/utter.desktop "$ROOT/usr/share/applications/utter.desktop"
 install -m 644 data/utter.svg "$ROOT/usr/share/icons/hicolor/scalable/apps/utter.svg"
+install -m 644 data/utter-tray.svg "$ROOT/usr/lib/utter/utter-tray.svg"
 install -m 644 LICENSE "$ROOT/usr/share/doc/utter/copyright"
 
 cat > "$ROOT/DEBIAN/control" <<EOF

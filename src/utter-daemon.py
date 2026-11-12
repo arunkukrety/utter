@@ -12,6 +12,10 @@ import array, ast, asyncio, json, math, os, shutil, signal, subprocess, time
 
 import websockets
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hinglish import romanize  # noqa: E402  (lives next to this file)
+
 RATE, CHUNK = 16000, 640  # 20 ms of 16-bit mono
 FAST = "3"  # ms per key hold and between keys (ydotool defaults are 20+20); raise if an app drops letters
 os.environ.setdefault("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket")
@@ -32,7 +36,11 @@ class Typer:
         if erase:
             subprocess.run(["ydotool", "key", "-d", FAST, *(["14:1", "14:0"] * erase)], stderr=subprocess.DEVNULL)
         if add:
-            subprocess.run(["ydotool", "type", "-d", FAST, "-H", FAST, "--", add], stderr=subprocess.DEVNULL)
+            if add.isascii():
+                subprocess.run(["ydotool", "type", "-d", FAST, "-H", FAST, "--", add], stderr=subprocess.DEVNULL)
+            else:  # ydotool types US-keyboard characters only, so anything else is pasted
+                subprocess.run(["wl-copy", "--", add], stderr=subprocess.DEVNULL, timeout=3)
+                subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], stderr=subprocess.DEVNULL)  # Ctrl+V
         self.shown = text
 
     def commit(self, text: str) -> None:
@@ -54,7 +62,7 @@ def read_key() -> str:
 
 
 KEY = read_key()
-KEY_CHANGED = False  # set by SIGHUP (the API keys page): reconnect with the new key
+KEY_CHANGED = False  # set by SIGHUP (a new key or language in the window): reconnect with it
 
 
 def reload_key() -> None:
@@ -62,10 +70,10 @@ def reload_key() -> None:
     try:
         KEY = read_key()
         KEY_CHANGED = True
-        LOG("key reloaded")
+        LOG("key and settings reloaded; reconnecting")
     except OSError as exc:
         LOG(f"key reload failed: {exc}")
-URL = ("wss://api.deepgram.com/v1/listen?model=nova-3&language=en&encoding=linear16&sample_rate=16000&channels=1"
+URL = ("wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate=16000&channels=1"
        "&interim_results=true&punctuate=true&smart_format=true&endpointing=300")
 KEEPALIVE_S, REFRESH_S = 5, 1800
 LOG = lambda m: print(f"{time.strftime('%H:%M:%S')} {m}", flush=True)
@@ -85,6 +93,9 @@ def play(name: str) -> None:
         pass
 
 
+MIN_FLOOR, DB_RANGE = 150, 21  # voice bars: full height at DB_RANGE dB above the room noise (raise for calmer bars)
+
+
 class Popup:
     """The on-screen pill (utter-popup.py), started once and kept hidden so it appears instantly.
     A broken popup never stops dictation; a dead one is restarted on the next press."""
@@ -101,6 +112,8 @@ class Popup:
             self.proc = None
 
     def begin(self) -> None:
+        self.recent = []  # mic levels for the noise floor, per dictation
+        self.heard = []  # every level this dictation, for the summary in the log
         if self.proc is None or self.proc.poll() is not None:
             self._spawn()
         self._send("S")
@@ -110,6 +123,16 @@ class Popup:
         """The stop press: chime now; hide now, or show the loader until hide() once the text is typed."""
         play("stop.wav")
         self._send("P" if wait_for_text else "H")
+
+    def summary(self) -> str:
+        """Mic levels for this dictation, to tune DB_RANGE against a real voice."""
+        if not getattr(self, "heard", None):
+            return "no audio"
+        h = sorted(self.heard)
+        floor = max(MIN_FLOOR, h[len(h) // 5] * 1.1)
+        loud = h[int(len(h) * 0.9)]
+        return (f"room ~{floor:.0f} RMS, your speech ~{loud:.0f} RMS (90th pct) = "
+                f"{20 * math.log10(max(loud, 1) / floor):.1f} dB above the room")
 
     def hide(self) -> None:
         self._send("H")
@@ -128,7 +151,14 @@ class Popup:
     def level(self, pcm: bytes) -> None:
         samples = array.array("h", pcm)
         rms = math.sqrt(sum(x * x for x in samples) / len(samples))
-        self._send(f"L {min(1.0, rms / 3000) ** 0.6:.3f}")  # 3000 RMS ~ normal speech at a laptop mic
+        # the room's own noise is the quiet end of the last ~2 s; only sound above it moves the bars
+        self.recent = (self.recent + [rms])[-50:]
+        self.heard.append(rms)
+        floor = max(MIN_FLOOR, sorted(self.recent)[len(self.recent) // 5] * 1.1)
+        # loudness is heard on a log scale, so the bars measure decibels above the room: whisper low, speech mid,
+        # raised voice near the top, instead of all-or-nothing
+        above_db = 20 * math.log10(max(rms, 1.0) / floor)
+        self._send(f"L {min(1.0, max(0.0, above_db / DB_RANGE)):.3f}")
 
     def _send(self, line: str) -> None:
         if self.proc and self.proc.poll() is None:
@@ -142,8 +172,11 @@ class Popup:
 
 async def connect():
     t = time.monotonic()
-    ws = await websockets.connect(URL, additional_headers={"Authorization": f"Token {KEY}"}, max_size=None)
-    LOG(f"warm socket ready in {(time.monotonic() - t) * 1000:.0f} ms")
+    # "multi" follows you between English and Hindi mid-sentence; "en" is English only (the default)
+    language = "multi" if setting("language") == "multi" else "en"
+    ws = await websockets.connect(f"{URL}&language={language}", additional_headers={"Authorization": f"Token {KEY}"},
+                                  max_size=None)
+    LOG(f"warm socket ready ({language}) in {(time.monotonic() - t) * 1000:.0f} ms")
     return ws
 
 
@@ -174,6 +207,7 @@ async def dictate(ws, stop: asyncio.Event, pressed_at: float):
     popup.begin()
     said = []  # final segments, for the clipboard and history
     live = mode() == "live"  # "once": type nothing until the dictation ends, then type it all
+    roman = setting("hindi") != "devanagari"  # Hindi as Roman Hinglish unless Settings says Devanagari
     conn = {"ws": ws, "heard": time.monotonic(), "receiver": None}
 
     async def receive(sock):
@@ -186,6 +220,8 @@ async def dictate(ws, stop: asyncio.Event, pressed_at: float):
                         LOG(f"{msg.get('type')}: {str(msg)[:150]}")
                     continue
                 text = msg["channel"]["alternatives"][0]["transcript"]
+                if roman:
+                    text = romanize(text)  # Hindi in Roman letters, as typed in chats
                 LOG(f"{'final' if msg.get('is_final') else 'interim'} {text!r}"[:160])
                 if msg.get("is_final"):
                     if live:
@@ -241,7 +277,7 @@ async def dictate(ws, stop: asyncio.Event, pressed_at: float):
                     break
                 await conn["ws"].send(data)
             n += 1
-            if n % 3 == 0:  # ~16 level updates a second
+            if n % 2 == 0:  # 25 level updates a second
                 popup.level(data)
             if first:
                 first = False
@@ -255,6 +291,7 @@ async def dictate(ws, stop: asyncio.Event, pressed_at: float):
     sender = asyncio.create_task(send_audio())
     try:
         await stop.wait()
+        LOG("mic levels: " + popup.summary())
         popup.stopped(wait_for_text=not live)  # live: hide on the press; all at once: loader until it is typed
         rec.terminate()
         await sender
@@ -294,6 +331,14 @@ def mic_args() -> list:
         LOG(f"chosen mic {mic!r} not found; using the system default")
         return []
     return [f"--device={mic}"]
+
+
+def setting(name: str):
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f).get(name)
+    except (OSError, ValueError):
+        return None
 
 
 def mode() -> str:
@@ -389,8 +434,20 @@ def ensure_hotkey() -> None:
         LOG(f"could not set up the shortcut: {exc}")
 
 
+def should_run() -> bool:
+    """With "Start at login" off, a start at login exits quietly; a start from Alt+D or the launcher runs."""
+    marker = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "utter-started-by-hand")
+    by_hand = os.path.exists(marker)
+    if by_hand:
+        os.remove(marker)
+    return by_hand or setting("autostart") is not False
+
+
 async def main() -> None:
     global POPUP
+    if not should_run():
+        LOG("Start at login is off; exiting until you press the shortcut")
+        return
     POPUP = Popup()
     ensure_hotkey()
     if not KEY:

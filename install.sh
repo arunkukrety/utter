@@ -48,12 +48,13 @@ fi
 say "Installing Utter…"
 mkdir -p "$APP/sounds" "$BIN" "$UNIT_DIR" "$DATA/applications" "$DATA/icons/hicolor/scalable/apps" "$CONFIG/utter"
 chmod 700 "$CONFIG/utter"
-install -m 644 src/utter-daemon.py src/utter-popup.py "$APP/"
+install -m 644 src/utter-daemon.py src/utter-popup.py src/hinglish.py "$APP/"
 install -m 644 sounds/start.wav sounds/stop.wav "$APP/sounds/"
 install -m 755 bin/utter "$BIN/utter"
 install -m 644 data/utter.service "$UNIT_DIR/utter.service"
 install -m 644 data/utter.desktop "$DATA/applications/utter.desktop"
 install -m 644 data/utter.svg "$DATA/icons/hicolor/scalable/apps/utter.svg"
+install -m 644 data/utter-tray.svg "$APP/utter-tray.svg"
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$DATA/icons/hicolor" 2>/dev/null || true
 command -v update-desktop-database >/dev/null && update-desktop-database -q "$DATA/applications" 2>/dev/null || true
 
@@ -72,6 +73,7 @@ fi
 # ---- 5. service ---------------------------------------------------------------------------------------------------
 systemctl --user daemon-reload
 systemctl --user enable utter.service >/dev/null 2>&1
+touch "${XDG_RUNTIME_DIR:-/tmp}/utter-started-by-hand"  # run now even if "Start at login" is off
 systemctl --user restart utter.service
 
 echo

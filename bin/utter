@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# utter            start or stop a dictation (bind this to a keyboard shortcut)
+# utter settings   open the window: history, API key, typing mode, microphone
+# utter quit       stop Utter (the next `utter` starts it again)
+set -euo pipefail
+svc=utter
+case "${1:-toggle}" in
+  toggle) sig=USR1 ;;
+  settings|history|open) sig=USR2 ;;
+  quit|stop) exec systemctl --user stop "$svc" ;;
+  -h|--help|help) sed -n '2,4p' "$0" | sed 's/^# //'; exit 0 ;;
+  *) echo "utter: unknown command '$1' (try: utter --help)" >&2; exit 2 ;;
+esac
+if ! systemctl --user is-active --quiet "$svc"; then
+  systemctl --user start "$svc"
+  sleep 2.5  # let it open its connection to Deepgram
+fi
+systemctl --user kill -s "$sig" --kill-whom=main "$svc"

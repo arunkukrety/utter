@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Utter
+GenericName=Dictation
+Comment=Push-to-talk dictation: speak and it types
+Exec=utter settings
+Icon=utter
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=dictation;speech;voice;transcribe;stt;

@@ -23,7 +23,7 @@ Tested on Ubuntu with GNOME on Wayland.
 **Ubuntu / Debian:** download the `.deb` from the [latest release](https://github.com/arunkukrety/utter/releases/latest) and install it:
 
 ```bash
-sudo apt install ./utter_1.0.0_all.deb
+sudo apt install ./utter_1.1.0_all.deb
 ```
 
 Then open **Utter** from your apps. It asks for your Deepgram key, binds **Alt+D** (if nothing else uses it), and starts by itself at every login. If Alt+D is taken, a notice tells you; bind any key to the command `utter` in *Settings → Keyboard → Custom Shortcuts*.

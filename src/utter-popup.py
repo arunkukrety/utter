@@ -21,6 +21,8 @@ GLib.set_prgname("utter")
 GLib.set_application_name("Utter")
 Gdk.set_program_class("utter")
 HERE = os.path.dirname(os.path.abspath(__file__))
+VERSION = "1.1.0"  # the one place the version lives; packaging/build-deb.sh reads it from here
+REPO = "arunkukrety/utter"
 
 BARS = 5
 IN_MS, OUT_MS = 220, 180
@@ -399,11 +401,57 @@ def settings_page() -> Gtk.Widget:
     mic_note = Gtk.Label(label="Takes effect on your next Alt+D. If the chosen mic is unplugged, the system default is used.",
                          xalign=0, wrap=True)
     mic_note.get_style_context().add_class("dim-label")
+    about_title = Gtk.Label(xalign=0, margin_top=14)
+    about_title.set_markup(f"<b>Utter {VERSION}</b>")
+    check = Gtk.Button(label="Check for updates", halign=Gtk.Align.START)
+    update_status = Gtk.Label(xalign=0, wrap=True)
+    download = Gtk.LinkButton(uri=f"https://github.com/{REPO}/releases/latest", label="Download the new version",
+                              halign=Gtk.Align.START)
+    download.set_no_show_all(True)
+
+    def show_result(latest, url, error) -> bool:
+        check.set_sensitive(True)
+        if error:
+            update_status.set_text(f"Couldn't check for updates ({error}).")
+        elif version_tuple(latest) > version_tuple(VERSION):
+            update_status.set_text(f"Utter {latest} is available. You have {VERSION}.")
+            download.set_uri(url)
+            download.show()
+        else:
+            update_status.set_text(f"You're up to date ({VERSION}).")
+            download.hide()
+        return False
+
+    def fetch_latest() -> None:
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                     headers={"Accept": "application/vnd.github+json", "User-Agent": f"Utter/{VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                rel = json.load(r)
+            GLib.idle_add(show_result, rel.get("tag_name", "").lstrip("v"), rel.get("html_url", ""), None)
+        except (OSError, ValueError) as e:
+            GLib.idle_add(show_result, "", "", getattr(e, "reason", None) or str(e))
+
+    def on_check(*_):
+        check.set_sensitive(False)
+        update_status.set_text("Checking…")
+        threading.Thread(target=fetch_latest, daemon=True).start()
+
+    check.connect("clicked", on_check)
+
     for w in (autostart, autostart_note, title, live, once, note, lang_title, english, mixed, hindi_title, roman, deva, hindi_note, mic_title,
-              mics, mic_note):
+              mics, mic_note, about_title, check, update_status, download):
         page.pack_start(w, False, False, 0)
     page.mics = mics
     return page
+
+
+def version_tuple(v: str) -> tuple:
+    """'1.10.0' -> (1, 10, 0), so versions compare as numbers; anything unparsable counts as oldest."""
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
 
 
 def list_mics() -> list:

@@ -2,7 +2,7 @@
 # Builds dist/utter_<version>_all.deb.   Usage: packaging/build-deb.sh [version]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${1:-1.0.0}"
+VERSION="${1:-$(sed -n 's/^VERSION = "\(.*\)".*/\1/p' src/utter-popup.py)}"
 ROOT="build/utter_${VERSION}_all"
 rm -rf "$ROOT"
 mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/lib/utter/sounds" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user" \

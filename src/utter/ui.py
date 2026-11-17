@@ -18,6 +18,8 @@ from . import VERSION, core, plat
 
 REPO = "arunkukrety/utter"
 MAC = sys.platform == "darwin"
+# developer build: run from source, or UTTER_DEV=1 (Settings then shows the server address field)
+DEV = not getattr(sys, "frozen", False) or os.environ.get("UTTER_DEV") == "1"
 BARS = 5
 MESSAGE_S = 2.5  # how long a notice like "Didn't catch that" stays up
 IN_MS, OUT_MS = 220, 180
@@ -388,6 +390,9 @@ class Window(QWidget):
         add(current)
         page.addLayout(row)
 
+        if DEV:
+            self.server_field(page)
+
         add(title("Shortcut"))
         key_row = QHBoxLayout()
         self.key_label = QLabel()
@@ -489,6 +494,47 @@ class Window(QWidget):
         page.addWidget(update_status)
         page.addWidget(download, 0, Qt.AlignLeft)
         page.addStretch(1)
+
+    def server_field(self, page: QVBoxLayout) -> None:
+        """Developer builds only: point the app at another Utter server (a local one, an SSH forward, staging)."""
+        page.addWidget(title("Server address (developer)"))
+        current = dim("")
+        entry = QLineEdit(placeholderText="wss://… or ws://127.0.0.1:18191/stream")
+        save, reset = QPushButton("Save"), QPushButton("Use default")
+        status = dim("")
+
+        def show() -> None:
+            custom = read_settings().get("server_url")
+            current.setText(f"Using: {custom or core.SERVER_URL}" + ("" if custom else " (default)"))
+
+        def on_save() -> None:
+            url = entry.text().strip()
+            if not url.startswith(("ws://", "wss://")):
+                status.setText("The address starts with wss:// (or ws:// for a local server).")
+                return
+            update_settings(server_url=url)
+            entry.clear()
+            status.setText("Saved. Used from your next dictation.")
+            show()
+            core.reload_key()  # reconnect to it before the next press
+
+        def on_reset() -> None:
+            update_settings(server_url=None)
+            status.setText("Back to the default server.")
+            show()
+            core.reload_key()
+
+        save.clicked.connect(on_save)
+        entry.returnPressed.connect(on_save)
+        reset.clicked.connect(on_reset)
+        row = QHBoxLayout()
+        row.addWidget(entry, 1)
+        row.addWidget(save)
+        row.addWidget(reset)
+        page.addWidget(current)
+        page.addLayout(row)
+        page.addWidget(status)
+        show()
 
     def fill_mics(self) -> None:
         """(Re)list the mics, keeping the saved choice selected, without rewriting the setting."""

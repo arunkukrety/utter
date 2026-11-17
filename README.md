@@ -2,83 +2,67 @@
 
 <h1 align="center">Utter</h1>
 
-<p align="center">Push-to-talk dictation for Linux. Press a key, speak, and your words are typed into whatever window you're in.</p>
+<p align="center">Push-to-talk dictation for Linux, macOS and Windows. Press a key, speak, and your words are pasted into whatever app you're in.</p>
 
 ---
 
-- **Instant start.** Utter keeps a connection to Deepgram open in the background, so recording starts about 0.1 s after you press the key.
-- **Two typing modes.** *Live* types words as you speak and fixes them as the transcript firms up. *All at once* types the whole thing when you stop.
-- **Nothing gets lost.** Every dictation is also copied to the clipboard and saved to a local History, so if no text box had focus, just press Ctrl+V.
-- **Small and quiet.** A tiny pill at the bottom of the screen shows a recording dot, live voice bars and a soft chime. It uses about 45 MB of memory.
-- **Survives drops.** If the connection breaks mid-sentence it reconnects in about a second and carries on.
-- **English, or English + Hindi.** In mixed mode it follows you between the two mid-sentence with no switching, and
-  types Hindi as Roman Hinglish ("kal meeting hai") or Devanagari, your choice.
+- **Press, speak, press.** Alt+D (Option+D on a Mac) starts and stops a dictation, or hold Alt (Option) on its own, speak, and let go.
+- **Clean text.** Filler words and false starts are dropped and your corrections applied ("five, no, six" → "six").
+- **Nothing gets lost.** Every dictation is also copied to the clipboard and saved to a local History.
+- **English, or English + Hindi.** In mixed mode it follows you between the two mid-sentence, and writes Hindi as Roman Hinglish ("kal meeting hai") or Devanagari, your choice.
+- **Small and quiet.** A tiny pill at the bottom of the screen shows a recording dot and live voice bars.
 
-Speech-to-text runs on [Deepgram](https://deepgram.com) (`nova-3`), so you need a Deepgram API key. New accounts get free credit.
+Utter needs an **Utter key**: paste it in Settings the first time it opens.
 
 ## Install
 
-Tested on Ubuntu with GNOME on Wayland.
-
-**Ubuntu / Debian:** download the `.deb` from the [latest release](https://github.com/arunkukrety/utter/releases/latest) and install it:
+**Ubuntu / Debian** (64-bit):
 
 ```bash
-sudo apt install ./utter_1.1.0_all.deb
+curl -fsSL https://arunkukrety.github.io/utter/setup.sh | sudo sh   # once: adds Utter's repository
+sudo apt install utter
 ```
 
-Then open **Utter** from your apps. It asks for your Deepgram key, binds **Alt+D** (if nothing else uses it), and starts by itself at every login. If Alt+D is taken, a notice tells you; bind any key to the command `utter` in *Settings → Keyboard → Custom Shortcuts*.
+Updates then arrive with your normal `sudo apt upgrade`. Open **Utter** from your apps; it binds Alt+D (if nothing else uses it) and starts at every login.
 
-**Other distros, or without sudo:** install from source into your home folder:
+**macOS** (Apple silicon): download `Utter-<version>-mac.dmg` from the [latest release](https://github.com/arunkukrety/utter/releases/latest), open it and drag Utter to Applications. The first time, right-click Utter and choose **Open**, then allow Microphone, Accessibility and Input Monitoring when macOS asks.
 
-```bash
-git clone https://github.com/arunkukrety/utter.git
-cd utter
-./install.sh
-```
-
-`install.sh` checks for what it needs and prints the install line if anything is missing. On Ubuntu that's:
-
-```bash
-sudo apt install python3-websockets python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
-  pulseaudio-utils ydotool wl-clipboard libnotify-bin
-```
-
-To build the `.deb` yourself, run `packaging/build-deb.sh 1.0.0`.
+**Windows**: download `Utter-Setup-<version>.exe` from the [latest release](https://github.com/arunkukrety/utter/releases/latest) and run it. If SmartScreen warns, choose **More info → Run anyway**.
 
 ## Use
 
 | | |
 |---|---|
-| **Alt+D** | start dictating; press again to stop |
-| Microphone icon in the top bar | History, copy the last dictation, settings, quit |
-| `utter settings` | open the window: History, API keys, typing mode, microphone |
-| `utter quit` | stop Utter (the next `utter` or Alt+D starts it again) |
+| **Alt+D** (⌥D) | start dictating; press again to stop |
+| **Hold Alt** (⌥) | hold on its own for half a second, speak, release to finish |
+| Utter icon in the top bar / menu bar / tray | History, copy the last dictation, Settings, quit |
 
-**Settings** has start at login, the typing mode, the language (English only, or English + Hindi) and the microphone. **API keys** checks a new key with Deepgram before saving it, and Utter switches to it without a restart.
+**Settings** has your Utter key, the shortcut, hold to talk, start at login, the language and the microphone.
+
+On Linux, hold-to-talk needs a one-time helper that watches the Alt key: `sudo /usr/lib/utter/install-hold.sh`.
 
 ## Privacy
 
-- Audio goes from your mic straight to Deepgram over an encrypted connection while you dictate, and only then. Utter has no server of its own.
-- Your key, settings and History stay on your machine, readable only by you: `~/.config/utter/` and `~/.local/share/utter/history.jsonl`.
+- Audio is streamed over an encrypted connection to the Utter server while you dictate, and only then. It returns the text and keeps no recording.
+- Your key, settings and History stay on your machine, readable only by you.
 
-## Troubleshooting
+## Troubleshooting (Linux)
 
-- **Nothing gets typed.** Utter types through `ydotool`, which needs its daemon running and write access to `/dev/uinput`. On Ubuntu: `systemctl --user enable --now ydotool`. Elsewhere, add yourself to the `input` group or add a udev rule for `/dev/uinput`. Your text is still on the clipboard either way.
+- **Nothing gets pasted.** Utter pastes through `ydotool`, which needs its service: `systemctl --user enable --now ydotool`. Your text is still on the clipboard either way.
 - **No top-bar icon on GNOME.** Install the *AppIndicator and KStatusNotifierItem Support* extension. Ubuntu ships it enabled.
-- **See what it's doing:** `journalctl --user -u utter -f`
+- **See what it's doing:** `journalctl --user -u utter -f` (macOS and Windows: `utter.log` in Utter's data folder).
 
 ## Uninstall
 
 ```bash
-sudo apt remove utter     # if you installed the .deb
-./uninstall.sh            # if you used install.sh (add --purge to also delete your key, settings and History)
+sudo apt remove utter
 ```
 
-The `.deb` leaves your key, settings and History in `~/.config/utter` and `~/.local/share/utter`; delete those folders to remove them.
+Your key, settings and History stay in `~/.config/utter` and `~/.local/share/utter`; delete those folders to remove them.
 
-## How it works
+## Building
 
-`utter` sends a signal to the `utter` user service (`src/utter-daemon.py`). The service records the mic with `parecord` in 20 ms chunks and streams them to Deepgram, then types the words it gets back with `ydotool`. It drives the popup, top-bar icon and window (`src/utter-popup.py`, GTK 3) over a pipe. The chimes are generated by `tools/make-sounds.py`.
+`.github/workflows/build.yml` builds the three installers (each on its own OS) and, for a `v*` tag, publishes them as a release and updates the apt repository. Locally: `pip install -r packaging/requirements.txt && pyinstaller packaging/utter.spec`, then `packaging/build-deb.sh` on Linux.
 
 ## License
 

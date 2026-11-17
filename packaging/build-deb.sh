@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# Builds dist/utter_<version>_all.deb.   Usage: packaging/build-deb.sh [version]
+# Builds dist/utter_<version>_amd64.deb from the PyInstaller folder dist/Utter (run pyinstaller packaging/utter.spec
+# first). Usage: packaging/build-deb.sh [version]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${1:-$(sed -n 's/^VERSION = "\(.*\)".*/\1/p' src/utter-popup.py)}"
-ROOT="build/utter_${VERSION}_all"
+VERSION="${1:-$(sed -n 's/^VERSION = "\(.*\)".*/\1/p' src/utter/__init__.py)}"
+[ -x dist/Utter/utter-app ] || { echo "dist/Utter/utter-app is missing: run pyinstaller packaging/utter.spec first"; exit 1; }
+ROOT="build/utter_${VERSION}_amd64"
 rm -rf "$ROOT"
-mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/lib/utter/sounds" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user" \
-         "$ROOT/usr/share/applications" "$ROOT/usr/share/icons/hicolor/scalable/apps" "$ROOT/usr/share/doc/utter" dist
+mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/lib" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user" \
+         "$ROOT/usr/share/applications" "$ROOT/usr/share/icons/hicolor/scalable/apps" "$ROOT/usr/share/doc/utter"
 
-install -m 644 src/utter-daemon.py src/utter-popup.py src/hinglish.py "$ROOT/usr/lib/utter/"
-install -m 644 sounds/start.wav sounds/stop.wav "$ROOT/usr/lib/utter/sounds/"
+cp -a dist/Utter "$ROOT/usr/lib/utter"
 install -m 755 bin/utter "$ROOT/usr/bin/utter"
-sed 's|%h/.local/share/utter/app/|/usr/lib/utter/|' data/utter.service > "$ROOT/usr/lib/systemd/user/utter.service"
+# hold-to-talk's optional root helper uses the system Python and its standard library only
+install -m 755 src/utter-hold.py install-hold.sh "$ROOT/usr/lib/utter/"
+sed 's|^ExecStart=.*|ExecStart=/usr/lib/utter/utter-app|' data/utter.service > "$ROOT/usr/lib/systemd/user/utter.service"
 chmod 644 "$ROOT/usr/lib/systemd/user/utter.service"
 install -m 644 data/utter.desktop "$ROOT/usr/share/applications/utter.desktop"
 install -m 644 data/utter.svg "$ROOT/usr/share/icons/hicolor/scalable/apps/utter.svg"
-install -m 644 data/utter-tray.svg "$ROOT/usr/lib/utter/utter-tray.svg"
 install -m 644 LICENSE "$ROOT/usr/share/doc/utter/copyright"
 
 cat > "$ROOT/DEBIAN/control" <<EOF
@@ -23,19 +25,18 @@ Package: utter
 Version: $VERSION
 Section: utils
 Priority: optional
-Architecture: all
-Depends: python3, python3-websockets, python3-gi, gir1.2-gtk-3.0, pulseaudio-utils, ydotool, wl-clipboard, libnotify-bin
-Recommends: gir1.2-ayatanaappindicator3-0.1, gnome-shell-extension-appindicator, ffmpeg
-Maintainer: $(git config user.name) <$(git config user.email)>
+Architecture: amd64
+Depends: pulseaudio-utils, ydotool, wl-clipboard, libnotify-bin, ffmpeg, libxcb-cursor0, libxkbcommon-x11-0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libegl1
+Recommends: gnome-shell-extension-appindicator, python3
+Maintainer: ${DEB_MAINTAINER:-$(git config user.name) <$(git config user.email)>}
 Homepage: https://github.com/arunkukrety/utter
-Description: Push-to-talk dictation for Linux
- Press a key, speak, and your words are typed into the focused window.
- Uses Deepgram's live speech-to-text (bring your own API key), copies every
- dictation to the clipboard and a local History, and shows a small popup
- with live voice bars while you speak.
+Description: Push-to-talk dictation
+ Press a key, speak, and your words are pasted into the focused window.
+ Copies every dictation to the clipboard and a local History, and shows a
+ small popup with live voice bars while you speak.
 EOF
 
-# start for every user at login; ydotool's own user service does the typing
+# start for every user at login; ydotool's own user service does the pasting
 cat > "$ROOT/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
@@ -58,5 +59,6 @@ EOF
 chmod 755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/prerm"
 
 find "$ROOT" -type d -exec chmod 755 {} +
-dpkg-deb --build --root-owner-group "$ROOT" "dist/utter_${VERSION}_all.deb" >/dev/null
-echo "dist/utter_${VERSION}_all.deb"
+mkdir -p dist
+dpkg-deb --build --root-owner-group -Zxz "$ROOT" "dist/utter_${VERSION}_amd64.deb" >/dev/null
+echo "dist/utter_${VERSION}_amd64.deb"

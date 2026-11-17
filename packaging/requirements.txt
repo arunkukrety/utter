@@ -1,0 +1,11 @@
+# What the packaged app needs (installed into the build machine's Python; the user installs nothing)
+PySide6-Essentials==6.12.0
+websockets==17.4
+sounddevice==0.5.6; sys_platform != "linux"
+pynput==1.8.2; sys_platform != "linux"
+imageio-ffmpeg==0.8.1; sys_platform != "linux"
+pyperclip==1.11.0; sys_platform == "win32"
+certifi; sys_platform == "darwin"
+# build only
+pyinstaller==6.22.3
+pillow

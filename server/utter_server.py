@@ -5,7 +5,7 @@ ElevenLabs Scribe v2 (batch) on the recording, then Groq cleanup, so the app mak
   POST /dictate?language=en|multi   body: the recording as MP3 (audio/mpeg)   header: Authorization: Bearer <token>
        -> {"text": cleaned, "raw": transcript, "stt_ms": .., "cleanup_ms": .., "total_ms": ..}
   GET  /health                      -> {"ok": true}
-  WS   /stream?language=&stt=&cleanup=  (port UTTER_WS_PORT)  header: Authorization: Bearer <token>
+  WS   /stream?language=&script=[&stt=&cleanup=]  (port UTTER_WS_PORT; providers default to DEFAULT_*)  header: Authorization: Bearer <token>
        send Ogg/Opus bytes as binary frames WHILE the user speaks, then the text frame "end", then (optional)
        {"live": "<the app's live transcript>"}: cleanup starts on it at once, while Scribe works on the audio, and is
        used if Scribe's transcript has the same words (a head start of about one cleanup);
@@ -37,6 +37,15 @@ OPENROUTER_CLEANUP_PROVIDER = os.environ.get("OPENROUTER_CLEANUP_PROVIDER", "gro
 SURPLUS_CLEANUP_MODEL = "llama-3.3-70b-instruct"
 GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 TOKEN = os.environ["UTTER_TOKEN"]
+# The app sends only the user's language and script; which providers run is decided here. A request may still name
+# them (older apps do), else these: AssemblyAI via OpenRouter, then Cerebras cleanup (each falls back to Groq).
+DEFAULT_STT = os.environ.get("UTTER_DEFAULT_STT") or ("openrouter" if OPENROUTER_KEY else "direct")
+DEFAULT_CLEANUP = os.environ.get("UTTER_DEFAULT_CLEANUP") or ("cerebras" if CEREBRAS_KEY else "groq")
+
+
+def pick(q: dict, name: str, default: str, allowed: tuple) -> str:
+    value = q.get(name, [default])[0]
+    return value if value in allowed else allowed[0]
 PORT = int(os.environ.get("UTTER_PORT", "8190"))
 WS_PORT = int(os.environ.get("UTTER_WS_PORT", "8191"))
 SCRIBE_MODEL = os.environ.get("SCRIBE_MODEL", "scribe_v2")
@@ -47,7 +56,7 @@ TIMEOUT_S = 20
 # cleanup normally takes 0.2-0.7 s; a stalled Groq request must retry (and then give up) inside the app's 8 s wait
 CLEANUP_TIMEOUT_S = 3
 
-# kept identical to the app's prompt (src/utter-daemon.py CLEANUP_PROMPT); deploy copies it in
+# the cleanup prompt lives only here; deploy copies cleanup_prompt.txt in
 CLEANUP_PROMPT = os.environ.get("CLEANUP_PROMPT") or open(os.path.join(os.path.dirname(__file__), "cleanup_prompt.txt")).read()
 # Hinglish typed the way people chat (Roman letters, English words spelled in English), for apps whose Hindi setting is
 # Roman: AssemblyAI writes Hinglish all in Devanagari, which letter-by-letter romanising turns into "miting", "minat"
@@ -264,8 +273,8 @@ class Handler(BaseHTTPRequestHandler):
         mp3 = self.rfile.read(length)
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
-        stt_route = q.get("stt", ["direct"])[0] if q.get("stt", ["direct"])[0] in ("surplus", "groq", "openrouter", "cartesia") else "direct"
-        cleaner = q.get("cleanup", ["groq"])[0] if q.get("cleanup", ["groq"])[0] in ("surplus", "none", "openrouter", "cerebras") else "groq"       # ?cleanup=groq|surplus
+        stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
+        cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras"))       # ?cleanup=groq|surplus
         t0 = time.monotonic()
         try:
             raw = transcribe(mp3, language, stt_route)
@@ -364,8 +373,8 @@ async def stream_handler(ws, path=None):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(req_path).query)
     language = q.get("language", ["en"])[0]
     roman = q.get("script", [""])[0] == "roman"
-    stt_route = q.get("stt", ["direct"])[0] if q.get("stt", ["direct"])[0] in ("surplus", "groq", "openrouter", "cartesia") else "direct"
-    cleaner = q.get("cleanup", ["groq"])[0] if q.get("cleanup", ["groq"])[0] in ("surplus", "none", "openrouter", "cerebras") else "groq"
+    stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
+    cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras"))
     audio = bytearray()
     try:
         async for msg in ws:

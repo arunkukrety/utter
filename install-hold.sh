@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hold-to-talk for Utter: hold Alt alone for 0.5 s to dictate, release to stop. Run once with sudo:
-#   sudo ./install-hold.sh          (uninstall: sudo ./install-hold.sh --remove)
+#   sudo /usr/lib/utter/install-hold.sh     (uninstall: add --remove; from a checkout: sudo ./install-hold.sh)
 # Reading the keyboard needs root, so this installs a small root-owned service OUTSIDE your home folder (nothing your
 # user can edit runs as root), instead of putting you in the "input" group, which would let any of your programs read
 # every keystroke. The service only watches for the Alt key and signals Utter.
@@ -18,7 +18,9 @@ if [ "${1:-}" = --remove ]; then
 fi
 
 install -d -m 755 -o root -g root /usr/local/lib/utter
-install -m 755 -o root -g root src/utter-hold.py /usr/local/lib/utter/utter-hold.py
+HELPER=src/utter-hold.py
+[ -f "$HELPER" ] || HELPER=utter-hold.py  # installed by the .deb next to this script
+install -m 755 -o root -g root "$HELPER" /usr/local/lib/utter/utter-hold.py
 cat > /etc/systemd/system/utter-hold.service <<EOF
 [Unit]
 Description=Utter hold-to-talk: hold Alt alone to dictate (reads key events only, signals Utter)

@@ -7,7 +7,7 @@ final text), "R" shows the loader with "Reconnecting…", "A" returns to the bar
 Runs under XWayland (GDK_BACKEND=x11) on purpose: GNOME's Wayland ignores "don't take focus" and window positions,
 and a popup that took focus would receive the typed transcript instead of the app you are dictating into.
 """
-import json, math, os, signal, subprocess, sys, threading, time, urllib.error, urllib.request
+import ast, json, math, os, signal, subprocess, sys, threading, time, urllib.error, urllib.request
 
 os.environ["GDK_BACKEND"] = "x11"
 import gi
@@ -25,6 +25,7 @@ VERSION = "1.1.0"  # the one place the version lives; packaging/build-deb.sh rea
 REPO = "arunkukrety/utter"
 
 BARS = 5
+MESSAGE_S = 2.5  # how long a notice like "Didn't catch that" stays up
 IN_MS, OUT_MS = 220, 180
 SLIDE_PX = 18         # how far it rises while fading in
 BOTTOM_GAP = 40
@@ -59,7 +60,7 @@ box.pack_start(note, False, False, 0)
 win.add(box)
 
 state = {"history": [], "bars": [0.0] * BARS, "start": 0.0, "closing": None, "timer": None,
-         "processing": None}  # monotonic time the loader started, or None while listening
+         "processing": None, "message": False}  # monotonic time the loader started, or None while listening
 
 
 def ease_out(t: float) -> float:
@@ -81,6 +82,11 @@ def draw_loader(cr, since: float) -> None:
 
 def draw(_area, cr):
     now = time.monotonic() - state["start"]
+    if state["message"]:  # a short notice ("Didn't catch that"): a calm grey dot beside the text
+        cr.set_source_rgba(0.63, 0.63, 0.67, 0.9)
+        cr.arc(7, 11, 4.5, 0, 2 * math.pi)
+        cr.fill()
+        return
     if state["processing"] is not None:
         draw_loader(cr, time.monotonic() - state["processing"])
         return
@@ -140,7 +146,7 @@ def tick() -> bool:
 
 
 def show() -> None:
-    state.update(history=[], bars=[0.0] * BARS, start=time.monotonic(), closing=None, processing=None)
+    state.update(history=[], bars=[0.0] * BARS, start=time.monotonic(), closing=None, processing=None, message=False)
     note.hide()
     win.set_opacity(0)
     win.resize(1, 1)
@@ -155,14 +161,33 @@ def on_stdin(source, _cond):
     if not line:
         Gtk.main_quit()
         return False
-    line = line.rstrip("\n")
+    handle(line.rstrip("\n"))
+    return True
+
+
+def end_message() -> bool:
+    if state["message"]:  # still showing the notice (no new dictation started meanwhile)
+        handle("H")
+    return False
+
+
+def handle(line: str) -> None:
     if line == "S":
         show()
     elif line.startswith("W "):  # open the window on a page: history, keys or settings
         open_window(line[2:] or "history")
+    elif line.startswith("M "):  # a notice: shown for MESSAGE_S seconds, then the pill fades out by itself
+        if state["timer"] is None or state["closing"] is not None:
+            show()  # the pill may already be gone (live mode hides it on the stop press)
+        state["processing"], state["message"] = None, True
+        note.set_text(line[2:])
+        note.show()
+        win.resize(1, 1)
+        GLib.timeout_add(int(MESSAGE_S * 1000), end_message)
     elif line == "R":  # connection lost: loader plus "Reconnecting…" while it is rebuilt
         if state["timer"] is not None and state["closing"] is None:
             state["processing"] = time.monotonic()
+            note.set_text("Reconnecting…")
             note.show()
             win.resize(1, 1)
     elif line == "A":  # reconnected: back to the listening bars
@@ -306,7 +331,64 @@ def keys_page() -> Gtk.Widget:
     entry.connect("activate", on_save)
     for w in (title, current, entry, save, status):
         page.pack_start(w, False, False, 0)
+    page.pack_start(cleanup_key_row("elevenlabs", "ElevenLabs", "for speech recognition", reconnect=True),
+                    False, False, 0)
+    page.pack_start(cleanup_key_row("assemblyai", "AssemblyAI", "for speech recognition", reconnect=True),
+                    False, False, 0)
+    for provider, label in CLEANUP_PROVIDERS:
+        page.pack_start(cleanup_key_row(provider, label), False, False, 0)
     return page
+
+
+CLEANUP_PROVIDERS = (("surplus", "Surplus Intelligence"), ("groq", "Groq"))
+
+
+def cleanup_key_row(provider: str, label: str, purpose: str = "for AI cleanup", reconnect: bool = False) -> Gtk.Widget:
+    """A provider key saved as CONFIG/<provider>.key. Used the next time you dictate (reconnect: right away)."""
+    path = os.path.join(CONFIG, f"{provider}.key")
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=18)
+    title = Gtk.Label(xalign=0)
+    title.set_markup(f"<b>{label} API key</b> <small>({purpose})</small>")
+
+    def masked() -> str:
+        try:
+            k = open(path).read().strip()
+        except OSError:
+            return "No key saved"
+        return f"Current: {k[:4]}…{k[-4:]}" if len(k) > 8 else "Current: saved"
+
+    current = Gtk.Label(label=masked(), xalign=0)
+    current.get_style_context().add_class("dim-label")
+    entry = Gtk.Entry(visibility=False, placeholder_text="Paste a key")
+    row = Gtk.Box(spacing=8)
+    save = Gtk.Button(label="Save")
+    remove = Gtk.Button(label="Remove")
+    row.pack_start(entry, True, True, 0)
+    row.pack_start(save, False, False, 0)
+    row.pack_start(remove, False, False, 0)
+
+    def on_save(*_):
+        key = entry.get_text().strip()
+        if key:
+            write_private(path, key)
+            entry.set_text("")
+            current.set_text(masked())
+            if reconnect:
+                os.kill(os.getppid(), signal.SIGHUP)  # the daemon reconnects with it
+
+    def on_remove(*_):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        current.set_text(masked())
+
+    save.connect("clicked", on_save)
+    entry.connect("activate", on_save)
+    remove.connect("clicked", on_remove)
+    for w in (title, current, row):
+        box.pack_start(w, False, False, 0)
+    return box
 
 
 def settings_page() -> Gtk.Widget:
@@ -329,6 +411,78 @@ def settings_page() -> Gtk.Widget:
     live.connect("toggled", on_toggle)
     once.connect("toggled", on_toggle)
 
+    key_title = Gtk.Label(xalign=0)
+    key_title.set_markup("<b>Shortcut</b>")
+    key_row = Gtk.Box(spacing=12)
+    key_label = Gtk.Label(xalign=0)
+    key_change = Gtk.Button(label="Change")
+    key_row.pack_start(key_label, False, False, 0)
+    key_row.pack_start(key_change, False, False, 0)
+    key_status = Gtk.Label(xalign=0, wrap=True)
+    key_status.get_style_context().add_class("dim-label")
+    capture = {"handler": None}
+
+    def show_key() -> None:
+        accel = current_shortcut()
+        if accel is None:  # not GNOME: point at the desktop's own settings
+            key_label.set_text("Set in your desktop's keyboard settings")
+            key_change.set_no_show_all(True)
+            key_change.hide()
+            key_status.set_text("Bind any key to the command: utter")
+        else:
+            key_label.set_text(pretty_accel(accel))
+
+    def stop_capture() -> None:
+        if capture["handler"] is not None:
+            page.get_toplevel().disconnect(capture["handler"])
+            capture["handler"] = None
+        key_change.set_label("Change")
+
+    def on_key(_win, event) -> bool:
+        if event.is_modifier:
+            return True  # wait for the real key
+        mods = event.state & Gtk.accelerator_get_default_mod_mask()
+        key = Gdk.keyval_to_lower(event.keyval)
+        if key == Gdk.KEY_Escape and not mods:
+            stop_capture()
+            key_status.set_text("")
+            return True
+        name = Gdk.keyval_name(key) or ""
+        if not mods and not (name.startswith("F") and name[1:].isdigit()):
+            key_status.set_text("Use a combination with Ctrl, Alt or Super (or an F key), so normal typing isn't caught.")
+            return True
+        accel = Gtk.accelerator_name(key, mods)
+        error = set_shortcut(accel)
+        stop_capture()
+        key_status.set_text(error or f"Saved. Press {pretty_accel(accel)} to dictate.")
+        show_key()
+        return True
+
+    def on_change(*_):
+        if capture["handler"] is not None:
+            stop_capture()
+            return
+        key_change.set_label("Press the new shortcut… (Esc to cancel)")
+        key_status.set_text("")
+        capture["handler"] = page.get_toplevel().connect("key-press-event", on_key)
+
+    key_change.connect("clicked", on_change)
+    show_key()
+
+    hold = Gtk.CheckButton(label="Hold Alt to talk: hold Alt on its own for half a second, speak, release to finish",
+                           margin_top=6)
+    hold.set_active(read_settings().get("hold_to_talk", True) is not False)
+
+    def on_hold(button):
+        cfg = read_settings()
+        cfg["hold_to_talk"] = button.get_active()
+        write_private(SETTINGS, json.dumps(cfg))  # the helper reads it at each press
+
+    hold.connect("toggled", on_hold)
+    hold_note = Gtk.Label(label="Alt with any other key (Alt+Tab, Alt+D) never starts it. Needs the one-time "
+                                "helper: sudo ./install-hold.sh in the Utter folder.", xalign=0, wrap=True)
+    hold_note.get_style_context().add_class("dim-label")
+
     autostart = Gtk.CheckButton(label="Start Utter when I log in", margin_top=14)
     autostart.set_active(read_settings().get("autostart") is not False)
 
@@ -341,6 +495,83 @@ def settings_page() -> Gtk.Widget:
     autostart_note = Gtk.Label(label="When off, Utter starts the first time you press the shortcut instead.",
                                xalign=0, wrap=True)
     autostart_note.get_style_context().add_class("dim-label")
+
+    insert_title = Gtk.Label(xalign=0, margin_top=14)
+    insert_title.set_markup("<b>Insert text by</b>")
+    by_paste = Gtk.RadioButton.new_with_label(None, "Pasting: the whole text appears at once (fastest)")
+    by_type = Gtk.RadioButton.new_with_label_from_widget(by_paste, "Typing it out: letters appear one by one")
+    (by_type if read_settings().get("insert") == "type" else by_paste).set_active(True)
+    insert_note = Gtk.Label(label="Pasting uses Ctrl+V, which terminals don't take (they use Ctrl+Shift+V). In a "
+                                  "terminal, choose typing, or paste the text yourself: it is on the clipboard.",
+                            xalign=0, wrap=True)
+    insert_note.get_style_context().add_class("dim-label")
+
+    def on_insert(button):
+        if button.get_active():
+            cfg = read_settings()
+            cfg["insert"] = "type" if button is by_type else "paste"
+            write_private(SETTINGS, json.dumps(cfg))  # read at the start of each dictation
+
+    by_paste.connect("toggled", on_insert)
+    by_type.connect("toggled", on_insert)
+
+    stt_title = Gtk.Label(xalign=0, margin_top=14)
+    stt_title.set_markup("<b>Speech to text</b>")
+    # each option sets: live engine (stt), the accurate pass after you stop (accurate), and where that pass runs
+    STT_OPTIONS = [
+        ("el-accurate", "ElevenLabs: Scribe v3 live, then Scribe v2 on the whole recording (most accurate)",
+         {"stt": "elevenlabs", "accurate": True, "accurate_route": "elevenlabs"}),
+        ("el-accurate-surplus", "ElevenLabs: Scribe v3 live, then Scribe v2 through Surplus (your Surplus key)",
+         {"stt": "elevenlabs", "accurate": True, "accurate_route": "surplus"}),
+        ("server-simple", "Utter server: Groq Whisper → cleanup, nothing else (no live transcript; one provider, cheapest)",
+         {"stt": "none", "accurate": True, "accurate_route": "server", "server_stt": "groq"}),
+        ("server-cartesia", "Utter server: Cartesia Ink-Whisper → cleanup (no live transcript; falls back to Groq Whisper)",
+         {"stt": "none", "accurate": True, "accurate_route": "server", "server_stt": "cartesia"}),
+        ("server-openrouter", "Utter server: AssemblyAI via OpenRouter → cleanup (no live transcript; falls back to Groq Whisper)",
+         {"stt": "none", "accurate": True, "accurate_route": "server", "server_stt": "openrouter"}),
+        ("server", "Utter server: stream to your server while you speak; Groq Whisper + Groq cleanup run there (fastest)",
+         {"stt": "elevenlabs", "accurate": True, "accurate_route": "server", "server_stt": "groq"}),
+        ("server-scribe", "Utter server: as above, with ElevenLabs Scribe v2 instead of Whisper",
+         {"stt": "elevenlabs", "accurate": True, "accurate_route": "server", "server_stt": "direct"}),
+        ("groq-local", "Groq Whisper from this computer: ElevenLabs live, then Whisper on the whole recording",
+         {"stt": "elevenlabs", "accurate": True, "accurate_route": "groq"}),
+        ("el-live", "ElevenLabs: Scribe v3 live only (faster)",
+         {"stt": "elevenlabs", "accurate": False}),
+        # AssemblyAI streaming bills every second a connection is open, idle included: reached via OpenRouter instead
+        ("dg-accurate", "Deepgram: nova-3 live, then nova-3 on the whole recording",
+         {"stt": "deepgram", "accurate": True, "accurate_route": "deepgram"}),
+        ("dg-live", "Deepgram: nova-3 live only (fastest)",
+         {"stt": "deepgram", "accurate": False}),
+    ]
+
+    def current_stt() -> str:
+        cfg = read_settings()
+        for oid, _label, values in STT_OPTIONS:
+            if all(cfg.get(k, {"stt": "deepgram", "accurate": False, "server_stt": "groq"}.get(k)) == v
+                   for k, v in values.items()):
+                return oid
+        return "dg-live"
+
+    stt_buttons, group = [], None
+    for oid, label, values in STT_OPTIONS:
+        button = Gtk.RadioButton.new_with_label_from_widget(group, label)
+        group = group or button
+        button.set_active(oid == current_stt())
+
+        def on_stt(btn, values=values):
+            if btn.get_active():
+                cfg = read_settings()
+                live_changed = cfg.get("stt") != values["stt"]
+                cfg.update(values)
+                write_private(SETTINGS, json.dumps(cfg))
+                if live_changed:
+                    os.kill(os.getppid(), signal.SIGHUP)  # reconnect to the chosen live service
+
+        button.connect("toggled", on_stt)
+        stt_buttons.append(button)
+    stt_note = Gtk.Label(label="The whole-recording pass runs after you stop, in All at once mode. Each option needs "
+                               "its service's key on the API keys page.", xalign=0, wrap=True)
+    stt_note.get_style_context().add_class("dim-label")
 
     lang_title = Gtk.Label(xalign=0, margin_top=14)
     lang_title.set_markup("<b>Language</b>")
@@ -381,6 +612,46 @@ def settings_page() -> Gtk.Widget:
     english.connect("toggled", on_language)
     mixed.connect("toggled", on_language)
     show_hindi(mixed.get_active())
+
+    clean_title = Gtk.Label(xalign=0, margin_top=14)
+    clean_title.set_markup("<b>Cleanup</b>")
+    CLEAN_OPTIONS = [
+        ("off", "Off: paste what was transcribed", {"cleanup": False}),
+        ("groq-qwen", "Groq · qwen3.8-27b, thinking off (fastest, best in tests)",
+         {"cleanup": True, "cleanup_provider": "groq", "cleanup_model": "qwen/qwen3.8-27b"}),
+        ("groq-gptoss", "Groq · gpt-oss-120b, thinking low",
+         {"cleanup": True, "cleanup_provider": "groq", "cleanup_model": "openai/gpt-oss-120b"}),
+        ("surplus-llama", "Surplus · llama-3.3-70b-instruct (your Surplus key)",
+         {"cleanup": True, "cleanup_provider": "surplus", "cleanup_model": "llama-3.3-70b-instruct"}),
+    ]
+
+    def current_clean() -> str:
+        cfg = read_settings()
+        if not cfg.get("cleanup"):
+            return "off"
+        provider = cfg.get("cleanup_provider") or "surplus"
+        model = cfg.get("cleanup_model") or {"groq": "qwen/qwen3.8-27b", "surplus": "llama-3.3-70b-instruct"}[provider]
+        return next((oid for oid, _l, v in CLEAN_OPTIONS
+                     if v.get("cleanup_provider") == provider and v.get("cleanup_model") == model), "groq-qwen")
+
+    clean_buttons, cgroup = [], None
+    for oid, label, values in CLEAN_OPTIONS:
+        button = Gtk.RadioButton.new_with_label_from_widget(cgroup, label)
+        cgroup = cgroup or button
+        button.set_active(oid == current_clean())
+
+        def on_clean(btn, values=values):
+            if btn.get_active():
+                cfg = read_settings()
+                cfg.update(values)
+                write_private(SETTINGS, json.dumps(cfg))  # read at the start of each dictation
+
+        button.connect("toggled", on_clean)
+        clean_buttons.append(button)
+    clean_note = Gtk.Label(label="Drops filler words and applies your corrections (\"five, no, six\" → \"six\"), "
+                                 "in All at once mode. Needs the provider's key on the API keys page.",
+                           xalign=0, wrap=True)
+    clean_note.get_style_context().add_class("dim-label")
 
     mic_title = Gtk.Label(xalign=0, margin_top=14)
     mic_title.set_markup("<b>Microphone</b>")
@@ -439,11 +710,75 @@ def settings_page() -> Gtk.Widget:
 
     check.connect("clicked", on_check)
 
-    for w in (autostart, autostart_note, title, live, once, note, lang_title, english, mixed, hindi_title, roman, deva, hindi_note, mic_title,
+    for w in (key_title, key_row, key_status, hold, hold_note, autostart, autostart_note, title, live, once, note, insert_title, by_paste, by_type, insert_note, stt_title, *stt_buttons, stt_note, clean_title, *clean_buttons, clean_note, lang_title, english, mixed, hindi_title, roman, deva, hindi_note, mic_title,
               mics, mic_note, about_title, check, update_status, download):
         page.pack_start(w, False, False, 0)
     page.mics = mics
     return page
+
+
+# ---- the keyboard shortcut lives in GNOME's custom shortcuts, so Settings edits that entry --------------------------
+GNOME_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
+UTTER_KEY_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/utter/"
+
+
+def gset(*args) -> str:
+    return subprocess.run(["gsettings", *args], capture_output=True, text=True, timeout=5).stdout.strip()
+
+
+def shortcut_entries():
+    """GNOME's custom shortcuts as [(path, binding, command)], or None when they can't be read (not GNOME)."""
+    try:
+        raw = gset("get", GNOME_KEYS, "custom-keybindings")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not raw.startswith(("[", "@as [")):
+        return None
+    out = []
+    for path in ast.literal_eval(raw.removeprefix("@as ")):
+        node = f"{GNOME_KEYS}.custom-keybinding:{path}"
+        out.append((path, gset("get", node, "binding").strip("'"), gset("get", node, "command").strip("'"),
+                    gset("get", node, "name").strip("'")))
+    return out
+
+
+def is_utter(command: str) -> bool:
+    return bool(command) and os.path.basename(command.split()[0]) == "utter"
+
+
+def current_shortcut():
+    """Utter's shortcut as a GNOME accelerator ('<Alt>d'), '' if none is set, or None if this isn't GNOME."""
+    entries = shortcut_entries()
+    if entries is None:
+        return None
+    return next((b for _p, b, c, _n in entries if is_utter(c)), "")
+
+
+def set_shortcut(accel: str) -> str:
+    """Bind accel to Utter. Returns an error message, or '' on success. Never rewrites a list it could not read."""
+    entries = shortcut_entries()
+    if entries is None:
+        return "Couldn't read your keyboard shortcuts."
+    clash = next((n or c for _p, b, c, n in entries if b.lower() == accel.lower() and not is_utter(c)), None)
+    if clash:
+        return f"That key is already used by another shortcut: {clash}."
+    path = next((p for p, _b, c, _n in entries if is_utter(c)), None)
+    command = next((c for c in (os.path.expanduser("~/.local/bin/utter"), "/usr/bin/utter") if os.access(c, os.X_OK)),
+                   "utter")
+    if path is None:  # no entry yet: add one, appended to the list as read
+        path = UTTER_KEY_PATH
+        gset("set", GNOME_KEYS, "custom-keybindings", str([e[0] for e in entries] + [path]))
+        gset("set", f"{GNOME_KEYS}.custom-keybinding:{path}", "name", "Utter: start or stop dictation")
+        gset("set", f"{GNOME_KEYS}.custom-keybinding:{path}", "command", command)
+    gset("set", f"{GNOME_KEYS}.custom-keybinding:{path}", "binding", accel)
+    return ""
+
+
+def pretty_accel(accel: str) -> str:
+    if not accel:
+        return "None"
+    key, mods = Gtk.accelerator_parse(accel)
+    return Gtk.accelerator_get_label(key, mods) or accel
 
 
 def version_tuple(v: str) -> tuple:
@@ -486,6 +821,13 @@ def fill_mics(combo: Gtk.ComboBoxText) -> None:
 app_win = None
 
 
+def scrollable(page: Gtk.Widget) -> Gtk.Widget:
+    """Pages longer than the window scroll instead of being cut off."""
+    scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    scroll.add(page)
+    return scroll
+
+
 def open_window(page: str) -> None:
     global app_win
     if app_win is None:
@@ -498,9 +840,9 @@ def open_window(page: str) -> None:
         scroll.add(listbox)
         stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         stack.add_titled(scroll, "history", "History")
-        stack.add_titled(keys_page(), "keys", "API keys")
+        stack.add_titled(scrollable(keys_page()), "keys", "API keys")
         settings = settings_page()
-        stack.add_titled(settings, "settings", "Settings")
+        stack.add_titled(scrollable(settings), "settings", "Settings")
         sidebar = Gtk.StackSidebar(stack=stack)
         sidebar.set_size_request(150, -1)
         stack.connect("notify::visible-child-name",

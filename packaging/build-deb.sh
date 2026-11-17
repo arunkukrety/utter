@@ -25,7 +25,7 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: python3, python3-websockets, python3-gi, gir1.2-gtk-3.0, pulseaudio-utils, ydotool, wl-clipboard, libnotify-bin
-Recommends: gir1.2-ayatanaappindicator3-0.1, gnome-shell-extension-appindicator
+Recommends: gir1.2-ayatanaappindicator3-0.1, gnome-shell-extension-appindicator, ffmpeg
 Maintainer: $(git config user.name) <$(git config user.email)>
 Homepage: https://github.com/arunkukrety/utter
 Description: Push-to-talk dictation for Linux

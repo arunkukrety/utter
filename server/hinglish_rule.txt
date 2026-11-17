@@ -1,0 +1,1 @@
+- Hindi or Hinglish written in Devanagari or Urdu script: rewrite it in Roman letters the way people type in chats, with English words in their normal English spelling ("मीटिंग" becomes "meeting", "मिनट" becomes "minute", "प्लीज" becomes "please"). Pure English stays as it is.

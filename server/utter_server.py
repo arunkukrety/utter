@@ -16,7 +16,7 @@ Standard library only. Listens on 127.0.0.1; a Cloudflare tunnel puts HTTPS in f
 from the environment (systemd EnvironmentFile), never from the request. Provider connections are kept open and reused,
 so a request pays no handshake to ElevenLabs or Groq.
 """
-import re, asyncio, http.client, json, os, secrets, subprocess, threading, time
+import re, asyncio, hashlib, http.client, json, os, secrets, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -68,6 +68,31 @@ def save_dictation(audio: bytes, ext: str, meta: dict) -> None:
             json.dump(record, f, ensure_ascii=False, indent=2)
     except OSError as exc:
         print(time.strftime("%H:%M:%S"), f"could not save the dictation: {exc}", flush=True)
+
+
+# Utter keys, one per user: {sha256(key): {"name", "created", "revoked"}}, managed with utter_keys.py. Only hashes are
+# stored, so the file itself unlocks nothing. Re-read whenever it changes, so adding or revoking needs no restart.
+# UTTER_TOKEN stays valid as the owner's key.
+KEYS_FILE = os.path.join(os.environ.get("STATE_DIRECTORY") or "/var/lib/utter-server", "keys.json")
+_keys = {"mtime": None, "data": {}}
+
+
+def key_owner(authorization: str):
+    """The name behind an "Authorization: Bearer <key>" header, or None if the key is unknown or revoked."""
+    key = authorization[7:] if authorization.startswith("Bearer ") else ""
+    if not key:
+        return None
+    if secrets.compare_digest(key, TOKEN):
+        return "owner"
+    try:
+        mtime = os.stat(KEYS_FILE).st_mtime_ns
+        if mtime != _keys["mtime"]:
+            with open(KEYS_FILE) as f:
+                _keys.update(mtime=mtime, data=json.load(f))
+    except (OSError, ValueError):
+        pass  # no keys file yet, or a half-written one: keep what was loaded last
+    entry = _keys["data"].get(hashlib.sha256(key.encode()).hexdigest())
+    return entry["name"] if entry and not entry.get("revoked") else None
 
 
 def pick(q: dict, name: str, default: str, allowed: tuple) -> str:
@@ -292,7 +317,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path != "/dictate":
             return self.reply(404, {"error": "not found"})
-        if not secrets.compare_digest(self.headers.get("Authorization", ""), f"Bearer {TOKEN}"):
+        user = key_owner(self.headers.get("Authorization", ""))
+        if not user:
             return self.reply(401, {"error": "bad token"})
         length = int(self.headers.get("Content-Length") or 0)
         if not 0 < length <= MAX_AUDIO:
@@ -311,13 +337,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.log_message("dictate failed: %s", str(exc)[:200])
             self.reply(502, {"error": "transcription failed"})
-            return save_dictation(mp3, "mp3", {"language": language, "stt": stt_route, "cleanup": cleaner,
+            return save_dictation(mp3, "mp3", {"user": user, "language": language, "stt": stt_route, "cleanup": cleaner,
                                                "error": str(exc)[:500]})
         stt_ms, clean_ms = (t1 - t0) * 1000, (t2 - t1) * 1000
         self.log_message("dictate: %d KB audio, stt %.0f ms, cleanup %.0f ms", length // 1024, stt_ms, clean_ms)
         self.reply(200, {"text": text or raw, "raw": raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
                          "total_ms": round(stt_ms + clean_ms)})
-        save_dictation(mp3, "mp3", {"language": language, "stt": stt_route, "cleanup": cleaner, "raw": raw,
+        save_dictation(mp3, "mp3", {"user": user, "language": language, "stt": stt_route, "cleanup": cleaner, "raw": raw,
                                     "text": text or raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
                                     "total_ms": round(stt_ms + clean_ms)})
 
@@ -399,7 +425,8 @@ async def stream_handler(ws, path=None):
     # websockets 10 (Ubuntu 24.04) keeps these on the connection; 11+ on ws.request
     req_path = path or getattr(ws, "path", None) or ws.request.path
     headers = ws.request_headers if hasattr(ws, "request_headers") else ws.request.headers
-    if not secrets.compare_digest(headers.get("Authorization", ""), f"Bearer {TOKEN}"):
+    user = key_owner(headers.get("Authorization", ""))
+    if not user:
         await ws.close(code=4401, reason="bad token")
         return
     q = urllib.parse.parse_qs(urllib.parse.urlparse(req_path).query)
@@ -419,7 +446,7 @@ async def stream_handler(ws, path=None):
                 if not audio:
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "no audio"}))
                     return
-                meta = {"language": language, "script": "roman" if roman else "devanagari", "stt": stt_route,
+                meta = {"user": user, "language": language, "script": "roman" if roman else "devanagari", "stt": stt_route,
                         "cleanup": cleaner}
                 try:
                     result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman)

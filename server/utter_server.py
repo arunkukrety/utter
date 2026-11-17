@@ -43,6 +43,33 @@ DEFAULT_STT = os.environ.get("UTTER_DEFAULT_STT") or ("openrouter" if OPENROUTER
 DEFAULT_CLEANUP = os.environ.get("UTTER_DEFAULT_CLEANUP") or ("cerebras" if CEREBRAS_KEY else "groq")
 
 
+# Every dictation is kept: <day>/<HHMMSS>-<id>.<ogg|mp3> (the audio as received) and a .json beside it with the
+# transcript before and after cleanup. Days and times are UTC. The folder is the service's private state directory
+# (systemd StateDirectory, 0700). UTTER_SAVE_DICTATIONS=0 turns it off.
+SAVE_DICTATIONS = os.environ.get("UTTER_SAVE_DICTATIONS", "1") != "0"
+DICTATIONS = os.path.join(os.environ.get("STATE_DIRECTORY") or "/var/lib/utter-server", "dictations")
+
+
+def save_dictation(audio: bytes, ext: str, meta: dict) -> None:
+    """Writes the recording and its record. Runs after the reply is sent, and never fails a dictation."""
+    if not SAVE_DICTATIONS:
+        return
+    try:
+        now = time.time()
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        name = time.strftime("%H%M%S", time.gmtime(now)) + "-" + secrets.token_hex(3)
+        folder = os.path.join(DICTATIONS, day)
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        with open(os.path.join(folder, f"{name}.{ext}"), "wb") as f:
+            f.write(audio)
+        record = {"id": f"{day}/{name}", "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                  "audio": f"{name}.{ext}", "audio_bytes": len(audio), **meta}
+        with open(os.path.join(folder, f"{name}.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        print(time.strftime("%H:%M:%S"), f"could not save the dictation: {exc}", flush=True)
+
+
 def pick(q: dict, name: str, default: str, allowed: tuple) -> str:
     value = q.get(name, [default])[0]
     return value if value in allowed else allowed[0]
@@ -283,13 +310,18 @@ class Handler(BaseHTTPRequestHandler):
             t2 = time.monotonic()
         except Exception as exc:
             self.log_message("dictate failed: %s", str(exc)[:200])
-            return self.reply(502, {"error": "transcription failed"})
+            self.reply(502, {"error": "transcription failed"})
+            return save_dictation(mp3, "mp3", {"language": language, "stt": stt_route, "cleanup": cleaner,
+                                               "error": str(exc)[:500]})
         stt_ms, clean_ms = (t1 - t0) * 1000, (t2 - t1) * 1000
         self.log_message("dictate: %d KB audio, stt %.0f ms, cleanup %.0f ms", length // 1024, stt_ms, clean_ms)
         self.reply(200, {"text": text or raw, "raw": raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
                          "total_ms": round(stt_ms + clean_ms)})
+        save_dictation(mp3, "mp3", {"language": language, "stt": stt_route, "cleanup": cleaner, "raw": raw,
+                                    "text": text or raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
+                                    "total_ms": round(stt_ms + clean_ms)})
 
-    def log_message(self, fmt, *args):  # never log audio or text, only sizes and timings
+    def log_message(self, fmt, *args):  # the log gets sizes and timings only; text and audio go to DICTATIONS
         print(time.strftime("%H:%M:%S"), fmt % args, flush=True)
 
 
@@ -387,16 +419,23 @@ async def stream_handler(ws, path=None):
                 if not audio:
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "no audio"}))
                     return
+                meta = {"language": language, "script": "roman" if roman else "devanagari", "stt": stt_route,
+                        "cleanup": cleaner}
                 try:
                     result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman)
                 except Exception as exc:
                     print(time.strftime("%H:%M:%S"), "stream failed:", str(exc)[:200], flush=True)
                     await ws.send(json.dumps({"error": "transcription failed"}))  # details stay in the log
+                    await asyncio.to_thread(save_dictation, bytes(audio), "ogg", {**meta, "error": str(exc)[:500]})
                     return
                 print(time.strftime("%H:%M:%S"), f"stream: {len(audio) // 1024} KB opus, stt {result['stt_ms']} ms, "
                       f"cleanup {result['cleanup_ms']} ms{' (head start used)' if result['head_start'] else ''}",
                       flush=True)
                 await ws.send(json.dumps(result))
+                await asyncio.to_thread(save_dictation, bytes(audio), "ogg", {
+                    **meta, "raw": result["raw"], "text": result["text"], "stt_ms": result["stt_ms"],
+                    "cleanup_ms": result["cleanup_ms"], "total_ms": result["total_ms"],
+                    "head_start": result["head_start"]})
                 return
     except Exception:
         return  # the client went away mid-dictation

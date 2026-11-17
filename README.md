@@ -43,7 +43,8 @@ On Linux, hold-to-talk needs a one-time helper that watches the Alt key: `sudo /
 
 ## Privacy
 
-- Audio is streamed over an encrypted connection to the Utter server while you dictate, and only then. It returns the text and keeps no recording.
+- Audio is streamed over an encrypted connection to the Utter server while you dictate, and only then.
+- The server keeps each dictation (the recording and its text, before and after cleanup) to improve accuracy.
 - Your key, settings and History stay on your machine, readable only by you.
 
 ## Troubleshooting (Linux)

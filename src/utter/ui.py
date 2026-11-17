@@ -18,7 +18,7 @@ from . import VERSION, core, plat
 
 REPO = "arunkukrety/utter"
 MAC = sys.platform == "darwin"
-# developer build: run from source, or UTTER_DEV=1 (Settings then shows the server address field)
+# developer build: run from source, UTTER_DEV=1, or developer mode turned on in Settings (click the version 7 times)
 DEV = not getattr(sys, "frozen", False) or os.environ.get("UTTER_DEV") == "1"
 BARS = 5
 MESSAGE_S = 2.5  # how long a notice like "Didn't catch that" stays up
@@ -390,8 +390,12 @@ class Window(QWidget):
         add(current)
         page.addLayout(row)
 
-        if DEV:
-            self.server_field(page)
+        dev_box = QWidget()
+        dev_layout = QVBoxLayout(dev_box)
+        dev_layout.setContentsMargins(0, 0, 0, 0)
+        self.server_field(dev_layout)
+        dev_box.setVisible(DEV or bool(cfg.get("developer")))
+        page.addWidget(dev_box)
 
         add(title("Shortcut"))
         key_row = QHBoxLayout()
@@ -453,9 +457,30 @@ class Window(QWidget):
         add(dim("Takes effect on your next dictation. If the chosen mic is unplugged, the system default is used. "
                 f"Every dictation is pasted with {plat.PASTE_KEYS} and also copied to the clipboard and History."))
 
-        add(title(f"Utter {VERSION}"))
+        version = title(f"Utter {VERSION}")
+        add(version)
         check = QPushButton("Check for updates")
         update_status = QLabel(wordWrap=True)
+        clicks = {"n": 0}
+
+        def on_version_click(_event) -> None:
+            # Android-style: 7 clicks on the version turn developer mode on or off
+            clicks["n"] += 1
+            if clicks["n"] < 7:
+                return
+            clicks["n"] = 0
+            if DEV:
+                update_status.setText("This is a developer build: developer mode is always on.")
+                return
+            on = not read_settings().get("developer")
+            update_settings(developer=on or None)
+            if not on:
+                update_settings(server_url=None)  # leaving developer mode goes back to the default server
+                core.reload_key()
+            dev_box.setVisible(on)
+            update_status.setText("Developer mode on." if on else "Developer mode off. Using the default server.")
+
+        version.mousePressEvent = on_version_click
         download = QPushButton("Download the new version")
         download.hide()
         url = {"v": f"https://github.com/{REPO}/releases/latest"}

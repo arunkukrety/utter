@@ -20,9 +20,9 @@ CONFIG, DATA = plat.CONFIG, plat.DATA
 TOKEN_FILE = os.path.join(CONFIG, "server.token")  # the user's Utter key
 HISTORY = os.path.join(DATA, "history.jsonl")
 SETTINGS = os.path.join(CONFIG, "settings.json")  # written by the window's Settings page
-# ponytail: the default reaches the server through an SSH forward on this machine; set the public wss:// address here
-# (or "server_url" in settings.json, or UTTER_SERVER) once the server is published
-SERVER_URL = os.environ.get("UTTER_SERVER") or "ws://127.0.0.1:18191/stream"
+# The Utter server's public address (Tailscale Funnel in front of the VPS; only valid keys get past the handshake).
+# "server_url" in settings.json or UTTER_SERVER overrides it, e.g. for an SSH forward.
+SERVER_URL = os.environ.get("UTTER_SERVER") or "wss://vint-hill-maus.tail6d5405.ts.net/stream"
 REPLY_TIMEOUT_S = 8  # from "end" to the server's text
 LOG = lambda m: print(f"{time.strftime('%H:%M:%S')} {m}", flush=True)
 

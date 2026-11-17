@@ -283,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
             t2 = time.monotonic()
         except Exception as exc:
             self.log_message("dictate failed: %s", str(exc)[:200])
-            return self.reply(502, {"error": str(exc)[:300]})
+            return self.reply(502, {"error": "transcription failed"})
         stt_ms, clean_ms = (t1 - t0) * 1000, (t2 - t1) * 1000
         self.log_message("dictate: %d KB audio, stt %.0f ms, cleanup %.0f ms", length // 1024, stt_ms, clean_ms)
         self.reply(200, {"text": text or raw, "raw": raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
@@ -391,7 +391,7 @@ async def stream_handler(ws, path=None):
                     result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman)
                 except Exception as exc:
                     print(time.strftime("%H:%M:%S"), "stream failed:", str(exc)[:200], flush=True)
-                    await ws.send(json.dumps({"error": str(exc)[:300]}))
+                    await ws.send(json.dumps({"error": "transcription failed"}))  # details stay in the log
                     return
                 print(time.strftime("%H:%M:%S"), f"stream: {len(audio) // 1024} KB opus, stt {result['stt_ms']} ms, "
                       f"cleanup {result['cleanup_ms']} ms{' (head start used)' if result['head_start'] else ''}",

@@ -39,6 +39,15 @@ def _log_to_file(data_dir: str) -> None:
 def main() -> None:
     if LINUX:
         _ready()
+        if getattr(sys, "frozen", False):
+            # PyInstaller points LD_LIBRARY_PATH at its bundled libraries. This process has loaded them already; the
+            # programs it runs (gsettings, notify-send, wl-copy, ydotool, ffmpeg) must get the system's own, or they
+            # fail on the bundled, older glib (gsettings then silently saved nothing)
+            orig = os.environ.pop("LD_LIBRARY_PATH_ORIG", None)
+            if orig:
+                os.environ["LD_LIBRARY_PATH"] = orig
+            else:
+                os.environ.pop("LD_LIBRARY_PATH", None)
     if sys.platform == "darwin" and getattr(sys, "frozen", False):
         import certifi  # the bundled Python has no CA list of its own on a user's Mac
         os.environ.setdefault("SSL_CERT_FILE", certifi.where())

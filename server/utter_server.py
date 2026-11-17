@@ -427,6 +427,9 @@ async def stream_handler(ws, path=None):
     headers = ws.request_headers if hasattr(ws, "request_headers") else ws.request.headers
     user = key_owner(headers.get("Authorization", ""))
     if not user:
+        # who knocked with a bad or missing key; the key itself is never logged
+        print(time.strftime("%H:%M:%S"), "rejected:", "no key" if not headers.get("Authorization") else "unknown or revoked key",
+              "from", headers.get("Cf-Connecting-Ip") or headers.get("X-Forwarded-For") or "direct", flush=True)
         await ws.close(code=4401, reason="bad token")
         return
     q = urllib.parse.parse_qs(urllib.parse.urlparse(req_path).query)

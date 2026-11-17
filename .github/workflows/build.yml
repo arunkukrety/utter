@@ -109,6 +109,7 @@ jobs:
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
         run: |
+          sudo apt-get install -y -qq apt-utils  # apt-ftparchive
           echo "$APT_SIGNING_KEY" | gpg --batch --import
           key=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
           packaging/apt/build-repo.sh out/*.deb site "$key"

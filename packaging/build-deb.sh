@@ -26,7 +26,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: pulseaudio-utils, ydotool, wl-clipboard, libnotify-bin, ffmpeg, libxcb-cursor0, libxkbcommon-x11-0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libegl1
+Depends: pulseaudio-utils, ydotool, wl-clipboard, libnotify-bin, ffmpeg, libglib2.0-0t64 | libglib2.0-0, libgtk-3-0t64 | libgtk-3-0, libdbus-1-3, libfontconfig1, libfreetype6, libharfbuzz0b, libx11-6, libx11-xcb1, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render0, libxcb-render-util0, libxcb-shape0, libxcb-shm0, libxcb-sync1, libxcb-xfixes0, libxcb-xinerama0, libxcb-xkb1, libxcb-glx0, libegl1, libffi8, libexpat1
 Recommends: gnome-shell-extension-appindicator, python3
 Maintainer: ${DEB_MAINTAINER:-$(git config user.name) <$(git config user.email)>}
 Homepage: https://github.com/arunkukrety/utter

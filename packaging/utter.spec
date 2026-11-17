@@ -22,6 +22,16 @@ a = Analysis(
     excludes=["tkinter", "unittest", "pydoc_data"] + (["utter.plat.mac", "utter.plat.windows", "utter.plat.desktop",
                                                         "imageio_ffmpeg", "sounddevice", "pynput"] if LINUX else []),
 )
+if LINUX:
+    # Never ship the desktop's own libraries: copies from the build machine's older Ubuntu mixed with the user's
+    # newer GTK modules, input method and keyboard layouts and crashed on the first key press in a window (1.0.2).
+    # The .deb depends on them instead, so the system's matching versions load.
+    import re
+    SYSTEM_LIB = re.compile(r"lib(atk|atomic|glycin|lcms2|seccomp|atspi|blkid|brotli|bsd|cairo|cap\.|com_err|datrie|dbus-1|epoxy|expat|ffi|fontconfig|"
+                            r"freetype|fribidi|gcc_s|gcrypt|gdk|gio-|glib-|gmodule|gobject|gpg-error|graphite2|gssapi|"
+                            r"gthread|gtk|harfbuzz|jpeg|k5crypto|keyutils|krb5|lz4|md\.|mount|pango|pcre|pixman|png16|"
+                            r"selinux|stdc\+\+|systemd|thai|uuid|X|xcb|xkbcommon|zstd)")
+    a.binaries = [b for b in a.binaries if not SYSTEM_LIB.match(os.path.basename(b[0]))]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, [],

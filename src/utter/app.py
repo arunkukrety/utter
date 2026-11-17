@@ -99,7 +99,11 @@ def main() -> None:
         _linux_signals(app, window, core)
     elif "--background" not in sys.argv:
         window.open("history")
-    sys.exit(app.exec())
+    code = app.exec()
+    # Leave at once: a normal interpreter shutdown tears Qt down while the engine thread is still running, which
+    # segfaults. History and settings are written as they happen, so only the log needs flushing.
+    sys.stdout.flush()
+    os._exit(code)
 
 
 def _linux_signals(app, window, core) -> None:

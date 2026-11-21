@@ -1,0 +1,8 @@
+[Unit]
+Description=Deploy the Utter server from GitHub if a push changed it
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/utter-autodeploy

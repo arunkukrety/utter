@@ -1,0 +1,9 @@
+[Unit]
+Description=Check GitHub for Utter server changes every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target

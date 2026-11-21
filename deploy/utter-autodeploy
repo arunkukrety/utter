@@ -1,0 +1,45 @@
+#!/bin/bash
+# Deploy the Utter server from GitHub when a push changes it. Run every minute by utter-autodeploy.timer.
+# Polls instead of taking a webhook: nothing is exposed publicly and no shared secret is needed; the cost is up to
+# a minute's delay. Only the three runtime files are deployed, and only when one of them changed, so a push that
+# touches the app alone never restarts the server (a restart drops a dictation in flight).
+set -euo pipefail
+BRANCH=${UTTER_DEPLOY_BRANCH:-cross-platform-app}
+REPO=/opt/utter-deploy/repo
+DEST=/opt/utter-server
+STATE=/opt/utter-deploy/deployed
+FILES=(utter_server.py cleanup_prompt.txt hinglish_rule.txt)
+
+[ -d "$REPO/.git" ] || git clone -q --branch "$BRANCH" https://github.com/arunkukrety/utter.git "$REPO"
+cd "$REPO"
+git fetch -q origin "$BRANCH"
+want=$(for f in "${FILES[@]}"; do git rev-parse "FETCH_HEAD:server/$f"; done | sha256sum | cut -c1-16)
+[ "$(cat "$STATE" 2>/dev/null)" = "$want" ] && exit 0
+
+git reset -q --hard FETCH_HEAD
+sha=$(git rev-parse --short HEAD)
+python3 -m py_compile server/utter_server.py   # a broken file never reaches the live folder
+
+backup=/opt/utter-deploy/previous
+rm -rf "$backup" && mkdir -p "$backup"
+for f in "${FILES[@]}"; do cp -p "$DEST/$f" "$backup/"; done
+for f in "${FILES[@]}"; do install -m 644 "server/$f" "$DEST/$f"; done
+systemctl restart utter-server
+healthy() {  # /health answering 200 twice, 2 s apart: a crash-looping server can look "active" for a moment
+    for _ in $(seq 15); do
+        sleep 1
+        curl -sf -m 2 "http://127.0.0.1:${UTTER_PORT:-8190}/health" >/dev/null && sleep 2 &&
+            curl -sf -m 2 "http://127.0.0.1:${UTTER_PORT:-8190}/health" >/dev/null && return 0
+    done
+    return 1
+}
+if healthy; then
+    echo "$want" > "$STATE"
+    echo "deployed $sha"
+else
+    for f in "${FILES[@]}"; do install -m 644 "$backup/$f" "$DEST/$f"; done
+    systemctl restart utter-server
+    echo "$want" > "$STATE"   # do not retry the same broken commit every minute; the next push tries again
+    echo "deploy of $sha FAILED to start; rolled back to the previous files" >&2
+    exit 1
+fi

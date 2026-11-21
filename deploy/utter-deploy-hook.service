@@ -1,0 +1,11 @@
+[Unit]
+Description=GitHub push webhook that starts the Utter server auto-deploy
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/utter-deploy-hook
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

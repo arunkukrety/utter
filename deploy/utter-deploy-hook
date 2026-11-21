@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""GitHub push webhook for the Utter server: verify GitHub's signature, then start utter-autodeploy.service.
+
+Listens on 127.0.0.1 only; Tailscale Funnel publishes it at https://<host>/hooks/github. It never deploys by itself:
+it only starts the same deploy the backup timer runs, which re-checks GitHub for what changed. So a forged or replayed
+request could at worst cause a redundant check, and the signature check stops even that.
+"""
+import hashlib, hmac, json, os, subprocess
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+SECRET = open(os.environ.get("HOOK_SECRET_FILE", "/etc/utter-autodeploy/hook-secret"), "rb").read().strip()
+BRANCH = os.environ.get("UTTER_DEPLOY_BRANCH", "cross-platform-app")
+PORT = int(os.environ.get("HOOK_PORT", "8192"))
+MAX_BODY = 5 * 1024 * 1024  # GitHub caps a payload at 25 MB; a push to this repo is a few KB
+
+
+class Hook(BaseHTTPRequestHandler):
+    def answer(self, code: int, msg: str) -> None:
+        body = msg.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 < length <= MAX_BODY:
+            return self.answer(413, "bad length")
+        body = self.rfile.read(length)
+        want = "sha256=" + hmac.new(SECRET, body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(want, self.headers.get("X-Hub-Signature-256", "")):
+            return self.answer(401, "bad signature")
+        event = self.headers.get("X-GitHub-Event", "")
+        if event == "ping":
+            return self.answer(200, "pong")
+        if event != "push":
+            return self.answer(202, f"ignored {event}")
+        ref = json.loads(body).get("ref", "")
+        if ref != f"refs/heads/{BRANCH}":
+            return self.answer(202, f"ignored {ref}")
+        subprocess.run(["systemctl", "start", "--no-block", "utter-autodeploy.service"], check=False)
+        self.answer(202, "deploy started")
+
+    def log_message(self, fmt, *args):
+        print(fmt % args, flush=True)  # status lines only; bodies are never logged
+
+
+HTTPServer(("127.0.0.1", PORT), Hook).serve_forever()

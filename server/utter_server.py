@@ -18,6 +18,7 @@ so a request pays no handshake to ElevenLabs or Groq.
 """
 import re, asyncio, hashlib, http.client, json, os, secrets, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from urllib.parse import parse_qs, urlparse
 
 ELEVENLABS_KEY = os.environ["ELEVENLABS_KEY"]
@@ -40,7 +41,12 @@ TOKEN = os.environ["UTTER_TOKEN"]
 # The app sends only the user's language and script; which providers run is decided here. A request may still name
 # them (older apps do), else these: AssemblyAI via OpenRouter, then Cerebras cleanup (each falls back to Groq).
 DEFAULT_STT = os.environ.get("UTTER_DEFAULT_STT") or ("openrouter" if OPENROUTER_KEY else "direct")
-DEFAULT_CLEANUP = os.environ.get("UTTER_DEFAULT_CLEANUP") or ("cerebras" if CEREBRAS_KEY else "groq")
+DEFAULT_CLEANUP = os.environ.get("UTTER_DEFAULT_CLEANUP") or ("race" if CEREBRAS_KEY else "groq")
+# race: gpt-oss-120b on Cerebras and Groq at once, the first good answer wins. Both are free tiers whose queues spike
+# independently; 100 paced rounds of real dictations from this VPS (2026-11-21): race p50 271 / p99 647 ms, Cerebras
+# alone p99 2,109 ms. Same model on both, so the text does not depend on which one answered.
+RACE_CEREBRAS_MODEL = os.environ.get("RACE_CEREBRAS_MODEL", "gpt-oss-120b")
+RACE_GROQ_MODEL = os.environ.get("RACE_GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 # Every dictation is kept: <day>/<HHMMSS>-<id>.<ogg|mp3> (the audio as received) and a .json beside it with the
@@ -255,6 +261,8 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
         prompt += ("\nThis text is Hindi that the transcriber wrote in Urdu script. Write it in "
                    + ("Roman letters" if roman else "Devanagari") + ", same words.")
     msgs = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
+    if provider == "race":
+        return _race(msgs, len(text.split()))
     if provider == "surplus":
         body = json.dumps({"model": SURPLUS_CLEANUP_MODEL, "temperature": 0, "max_tokens": 2 * len(text.split()) + 512,
                            "messages": msgs}).encode()
@@ -293,6 +301,36 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     return (json.loads(data)["choices"][0]["message"]["content"] or "").strip()
 
 
+_racers = ThreadPoolExecutor(max_workers=8)  # the loser keeps running to its timeout, then hands its socket back
+
+
+def _ask(host: str, path: str, key: str, model: str, msgs: list, words: int) -> str:
+    body = json.dumps({"model": model, "temperature": 0, "max_tokens": 2 * words + 512, "reasoning_effort": "low",
+                       "messages": msgs}).encode()
+    status, data = call(host, "POST", path, body, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        CLEANUP_TIMEOUT_S)
+    if status != 200:
+        raise RuntimeError(f"HTTP {status}: {data[:120]!r}")
+    out = (json.loads(data)["choices"][0]["message"]["content"] or "").strip()
+    if not out:  # reasoning used up max_tokens: let the other provider answer
+        raise RuntimeError("empty answer")
+    return out
+
+
+def _race(msgs: list, words: int) -> str:
+    jobs = {_racers.submit(_ask, "api.cerebras.ai", "/v1/chat/completions", CEREBRAS_KEY, RACE_CEREBRAS_MODEL, msgs, words): "cerebras",
+            _racers.submit(_ask, "api.groq.com", "/openai/v1/chat/completions", GROQ_KEY, RACE_GROQ_MODEL, msgs, words): "groq"}
+    pending, errors = set(jobs), []
+    while pending:
+        done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        for f in done:
+            try:
+                return f.result()
+            except Exception as exc:
+                errors.append(f"{jobs[f]} {str(exc)[:100]}")
+    raise RuntimeError("both failed: " + "; ".join(errors))  # clean() then sends the raw transcript
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep the app's connection open between dictations
 
@@ -327,7 +365,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
         stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
-        cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras"))       # ?cleanup=groq|surplus
+        cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race"))       # ?cleanup=groq|surplus
         t0 = time.monotonic()
         try:
             raw = transcribe(mp3, language, stt_route)
@@ -436,7 +474,7 @@ async def stream_handler(ws, path=None):
     language = q.get("language", ["en"])[0]
     roman = q.get("script", [""])[0] == "roman"
     stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
-    cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras"))
+    cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race"))
     audio = bytearray()
     try:
         async for msg in ws:
@@ -482,5 +520,5 @@ if __name__ == "__main__":
     threading.Thread(target=keep_warm, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"utter-server on 127.0.0.1:{PORT} ({SCRIBE_MODEL} + {CLEANUP_MODEL})", flush=True)
+    print(f"utter-server on 127.0.0.1:{PORT} (stt {DEFAULT_STT}, cleanup {DEFAULT_CLEANUP})", flush=True)
     asyncio.run(serve_ws())

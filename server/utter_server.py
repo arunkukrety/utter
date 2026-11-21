@@ -17,6 +17,7 @@ from the environment (systemd EnvironmentFile), never from the request. Provider
 so a request pays no handshake to ElevenLabs or Groq.
 """
 import re, asyncio, hashlib, http.client, json, os, secrets, subprocess, threading, time
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from urllib.parse import parse_qs, urlparse
@@ -365,7 +366,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if urlparse(self.path).path == "/health":
-            return self.reply(200, {"ok": True})
+            ok = READY.is_set() and not DRAINING.is_set()
+            return self.reply(200 if ok else 503, {"ok": ok})
         self.reply(404, {"error": "not found"})
 
     def do_POST(self):
@@ -406,6 +408,11 @@ class Handler(BaseHTTPRequestHandler):
         print(time.strftime("%H:%M:%S"), fmt % args, flush=True)
 
 
+READY = threading.Event()  # set once every provider has a warm connection; /health says 503 until then
+DRAINING = threading.Event()  # set on SIGTERM: take no new dictations, finish the ones in flight, then exit
+DRAIN_S = 30  # longest a dictation in flight may hold up a stop (a long one: upload, STT, cleanup)
+
+
 def keep_warm() -> None:
     """Keep POOL_SIZE fresh, already-connected sockets per provider, so a request never waits for a handshake."""
     while True:
@@ -424,6 +431,7 @@ def keep_warm() -> None:
                         _pool[host].append(pair)
                 except OSError:
                     pass
+        READY.set()  # one full pass done (a provider that is down does not hold up readiness)
         time.sleep(5)
 
 
@@ -496,6 +504,7 @@ async def stream_handler(ws, path=None):
     try:
         async for msg in ws:
             if isinstance(msg, (bytes, bytearray)):
+                _busy.add(ws)  # a dictation has started on this connection: a drain waits for it
                 audio.extend(msg)
                 if len(audio) > MAX_AUDIO:
                     await ws.close(code=4413, reason="too much audio")
@@ -524,13 +533,42 @@ async def stream_handler(ws, path=None):
                 return
     except Exception:
         return  # the client went away mid-dictation
+    finally:
+        _busy.discard(ws)
 
 
-async def serve_ws():
-    import websockets
-    async with websockets.serve(stream_handler, "127.0.0.1", WS_PORT, max_size=MAX_AUDIO, ping_interval=20):
-        print(f"utter-server websocket on 127.0.0.1:{WS_PORT}", flush=True)
-        await asyncio.Future()
+_busy = set()  # connections with a dictation in flight
+
+
+async def ws_health(path, headers):
+    """GET /health on the WebSocket port, for the proxy's health check: 200 only when warm and not draining."""
+    if path.split("?")[0] == "/health":
+        ok = READY.is_set() and not DRAINING.is_set()
+        return HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE, [("Content-Type", "text/plain")], b"ok\n" if ok else b"not ready\n"
+    return None
+
+
+async def serve_ws(http_server):
+    import signal, websockets
+    stop = asyncio.Event()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
+    ws_server = await websockets.serve(stream_handler, "127.0.0.1", WS_PORT, max_size=MAX_AUDIO, ping_interval=20,
+                                       process_request=ws_health)
+    print(f"utter-server websocket on 127.0.0.1:{WS_PORT}", flush=True)
+    await stop.wait()
+    # Drain, the way a load balancer deregisters a target: the proxy already sends new connections to the new
+    # instance once it is healthy. Stop listening, close idle connections (the app reopens them, through the proxy,
+    # to the new instance), let dictations in flight finish, then exit.
+    DRAINING.set()
+    ws_server.server.close()
+    threading.Thread(target=http_server.shutdown, daemon=True).start()
+    idle = [c for c in ws_server.websockets if c not in _busy]
+    await asyncio.gather(*(c.close(1012, "server restarting") for c in idle), return_exceptions=True)
+    t = time.monotonic()
+    while _busy and time.monotonic() - t < DRAIN_S:
+        await asyncio.sleep(0.1)
+    print(time.strftime("%H:%M:%S"), f"drained: closed {len(idle)} idle, waited {time.monotonic() - t:.1f} s for "
+          f"in-flight dictations, {len(_busy)} still open", flush=True)
 
 
 if __name__ == "__main__":
@@ -538,4 +576,4 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"utter-server on 127.0.0.1:{PORT} (stt {DEFAULT_STT}, cleanup {DEFAULT_CLEANUP})", flush=True)
-    asyncio.run(serve_ws())
+    asyncio.run(serve_ws(server))

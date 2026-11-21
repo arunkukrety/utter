@@ -1,45 +1,54 @@
 #!/bin/bash
-# Deploy the Utter server from GitHub when a push changes it. Run every minute by utter-autodeploy.timer.
-# Polls instead of taking a webhook: nothing is exposed publicly and no shared secret is needed; the cost is up to
-# a minute's delay. Only the three runtime files are deployed, and only when one of them changed, so a push that
-# touches the app alone never restarts the server (a restart drops a dictation in flight).
+# Deploy the Utter server from GitHub when a push changes it, with no downtime, the way ECS rolls a service behind a
+# load balancer: two instances (utter-server@a, @b) sit behind utter-proxy (Caddy), which sends traffic only to an
+# instance whose /health answers 200. A deploy puts the new code in the IDLE instance's own folder, starts it, waits
+# until it is healthy (the proxy starts sending it traffic), then stops the old one, which drains: no new dictations,
+# in-flight ones finish, then it exits. A new version that never gets healthy is stopped and the old one keeps serving,
+# untouched. Started by the GitHub webhook (utter-deploy-hook) and every 15 minutes by utter-autodeploy.timer.
 set -euo pipefail
 BRANCH=${UTTER_DEPLOY_BRANCH:-cross-platform-app}
 REPO=/opt/utter-deploy/repo
-DEST=/opt/utter-server
 STATE=/opt/utter-deploy/deployed
 FILES=(utter_server.py cleanup_prompt.txt hinglish_rule.txt)
+declare -A WS_PORT=([a]=18191 [b]=28191)
 
 [ -d "$REPO/.git" ] || git clone -q --branch "$BRANCH" https://github.com/arunkukrety/utter.git "$REPO"
 cd "$REPO"
 git fetch -q origin "$BRANCH"
 want=$(for f in "${FILES[@]}"; do git rev-parse "FETCH_HEAD:server/$f"; done | sha256sum | cut -c1-16)
-[ "$(cat "$STATE" 2>/dev/null)" = "$want" ] && exit 0
+running=$(for c in a b; do systemctl is-active -q "utter-server@$c" && echo "$c"; done | head -1 || true)
+[ "$(cat "$STATE" 2>/dev/null)" = "$want" ] && [ -n "$running" ] && exit 0
 
 git reset -q --hard FETCH_HEAD
 sha=$(git rev-parse --short HEAD)
-python3 -m py_compile server/utter_server.py   # a broken file never reaches the live folder
+python3 -m py_compile server/utter_server.py   # a broken file never reaches an instance
+old=${running:-}
+new=$([ "$old" = a ] && echo b || echo a)
 
-backup=/opt/utter-deploy/previous
-rm -rf "$backup" && mkdir -p "$backup"
-for f in "${FILES[@]}"; do cp -p "$DEST/$f" "$backup/"; done
-for f in "${FILES[@]}"; do install -m 644 "server/$f" "$DEST/$f"; done
-systemctl restart utter-server
-healthy() {  # /health answering 200 twice, 2 s apart: a crash-looping server can look "active" for a moment
-    for _ in $(seq 15); do
+mkdir -p "/opt/utter-server/$new"
+for f in "${FILES[@]}"; do install -m 644 "server/$f" "/opt/utter-server/$new/$f"; done
+systemctl restart "utter-server@$new"
+
+healthy() {  # 200 three times in a row, 1 s apart (a crash-looping process can answer once); up to ~60 s
+    local streak=0
+    for _ in $(seq 60); do
         sleep 1
-        curl -sf -m 2 "http://127.0.0.1:${UTTER_PORT:-8190}/health" >/dev/null && sleep 2 &&
-            curl -sf -m 2 "http://127.0.0.1:${UTTER_PORT:-8190}/health" >/dev/null && return 0
+        if curl -sf -m 2 "http://127.0.0.1:${WS_PORT[$new]}/health" >/dev/null; then
+            streak=$((streak + 1)); [ $streak -ge 3 ] && return 0
+        else
+            streak=0
+        fi
     done
     return 1
 }
-if healthy; then
-    echo "$want" > "$STATE"
-    echo "deployed $sha"
-else
-    for f in "${FILES[@]}"; do install -m 644 "$backup/$f" "$DEST/$f"; done
-    systemctl restart utter-server
-    echo "$want" > "$STATE"   # do not retry the same broken commit every minute; the next push tries again
-    echo "deploy of $sha FAILED to start; rolled back to the previous files" >&2
+if ! healthy; then
+    systemctl stop "utter-server@$new"
+    echo "$want" > "$STATE"   # do not retry the same broken commit every 15 minutes; the next push tries again
+    echo "deploy of $sha FAILED: utter-server@$new never got healthy; utter-server@${old:-none} keeps serving" >&2
     exit 1
 fi
+sleep 2   # the proxy checks health every second: let it mark the new instance up before the old one goes away
+[ -n "$old" ] && systemctl stop "utter-server@$old"   # drains; returns once in-flight dictations are done
+systemctl enable -q "utter-server@$new" && { [ -z "$old" ] || systemctl disable -q "utter-server@$old"; }
+echo "$want" > "$STATE"
+echo "deployed $sha on utter-server@$new${old:+ (utter-server@$old drained and stopped)}"

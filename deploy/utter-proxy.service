@@ -1,0 +1,14 @@
+[Unit]
+Description=Utter proxy: health-checked load balancer in front of utter-server@a and @b
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/caddy run --config /etc/utter-proxy/Caddyfile --adapter caddyfile
+Restart=always
+RestartSec=1
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

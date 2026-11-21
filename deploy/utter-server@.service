@@ -1,0 +1,26 @@
+[Unit]
+Description=Utter server, instance %i (a and b, each with its own code in /opt/utter-server/%i, behind utter-proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/utter-server/env
+# the instance's own ports: UTTER_PORT / UTTER_WS_PORT (a: 18190/18191, b: 28190/28191)
+EnvironmentFile=/etc/utter-server/%i.env
+ExecStart=/usr/bin/python3 /opt/utter-server/%i/utter_server.py
+Restart=on-failure
+RestartSec=2
+# SIGTERM drains: no new dictations, in-flight ones finish (server's DRAIN_S = 30 s), then it exits
+TimeoutStopSec=40
+# both instances run as the same user and share the saved-dictations folder
+DynamicUser=yes
+User=utter-server
+StateDirectory=utter-server
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

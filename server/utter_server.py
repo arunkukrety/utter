@@ -41,10 +41,13 @@ TOKEN = os.environ["UTTER_TOKEN"]
 # The app sends only the user's language and script; which providers run is decided here. A request may still name
 # them (older apps do), else these: AssemblyAI via OpenRouter, then Cerebras cleanup (each falls back to Groq).
 DEFAULT_STT = os.environ.get("UTTER_DEFAULT_STT") or ("openrouter" if OPENROUTER_KEY else "direct")
-DEFAULT_CLEANUP = os.environ.get("UTTER_DEFAULT_CLEANUP") or ("race" if CEREBRAS_KEY else "groq")
-# race: gpt-oss-120b on Cerebras and Groq at once, the first good answer wins. Both are free tiers whose queues spike
-# independently; 100 paced rounds of real dictations from this VPS (2026-11-21): race p50 271 / p99 647 ms, Cerebras
-# alone p99 2,109 ms. Same model on both, so the text does not depend on which one answered.
+DEFAULT_CLEANUP = os.environ.get("UTTER_DEFAULT_CLEANUP") or ("orrace" if OPENROUTER_KEY else "cerebras" if CEREBRAS_KEY else "groq")
+# orrace: gpt-oss-120b through OpenRouter (paid), pinned once to Cerebras and once to Groq, sent at once; the first good
+# answer wins. 100 paced rounds of real dictations from this VPS (2026-11-21): p50 271 / p99 647 ms, Cerebras alone
+# p99 2,109 ms. Same model on both, so the text does not depend on which one answered. If both fail, Qwen on our own
+# Cerebras key cleans it. ~$1/month at one person's use.
+# race: the same race on our own FREE keys. Do not make it the default: Cerebras allows gpt-oss-120b only 5 requests a
+# minute on the free tier (Qwen: 450), so ordinary bursts of dictation got both sides 429 (57 of 100 in a 2026-11-21 test).
 RACE_CEREBRAS_MODEL = os.environ.get("RACE_CEREBRAS_MODEL", "gpt-oss-120b")
 RACE_GROQ_MODEL = os.environ.get("RACE_GROQ_MODEL", "openai/gpt-oss-120b")
 
@@ -262,7 +265,13 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
                    + ("Roman letters" if roman else "Devanagari") + ", same words.")
     msgs = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
     if provider == "race":
-        return _race(msgs, len(text.split()))
+        return _race(msgs, len(text.split()), DIRECT_RACERS)
+    if provider == "orrace":
+        try:
+            return _race(msgs, len(text.split()), OPENROUTER_RACERS)
+        except Exception as exc:
+            print(time.strftime("%H:%M:%S"), f"orrace cleanup failed ({str(exc)[:160]}); using cerebras", flush=True)
+            return _clean(text, "cerebras", roman)
     if provider == "surplus":
         body = json.dumps({"model": SURPLUS_CLEANUP_MODEL, "temperature": 0, "max_tokens": 2 * len(text.split()) + 512,
                            "messages": msgs}).encode()
@@ -304,9 +313,18 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
 _racers = ThreadPoolExecutor(max_workers=8)  # the loser keeps running to its timeout, then hands its socket back
 
 
-def _ask(host: str, path: str, key: str, model: str, msgs: list, words: int) -> str:
-    body = json.dumps({"model": model, "temperature": 0, "max_tokens": 2 * words + 512, "reasoning_effort": "low",
-                       "messages": msgs}).encode()
+# (name, host, path, key, extra body fields) per side of a race
+DIRECT_RACERS = (("cerebras", "api.cerebras.ai", "/v1/chat/completions", CEREBRAS_KEY,
+                  {"model": RACE_CEREBRAS_MODEL, "reasoning_effort": "low"}),
+                 ("groq", "api.groq.com", "/openai/v1/chat/completions", GROQ_KEY,
+                  {"model": RACE_GROQ_MODEL, "reasoning_effort": "low"}))
+OPENROUTER_RACERS = tuple((p, "openrouter.ai", "/api/v1/chat/completions", OPENROUTER_KEY,
+                           {"model": "openai/gpt-oss-120b", "reasoning": {"effort": "low"},
+                            "provider": {"only": [p], "allow_fallbacks": False}}) for p in ("cerebras", "groq"))
+
+
+def _ask(host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:
+    body = json.dumps({"temperature": 0, "max_tokens": 2 * words + 512, "messages": msgs, **extra}).encode()
     status, data = call(host, "POST", path, body, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                         CLEANUP_TIMEOUT_S)
     if status != 200:
@@ -314,12 +332,11 @@ def _ask(host: str, path: str, key: str, model: str, msgs: list, words: int) -> 
     out = (json.loads(data)["choices"][0]["message"]["content"] or "").strip()
     if not out:  # reasoning used up max_tokens: let the other provider answer
         raise RuntimeError("empty answer")
-    return out
+    return out.replace("\u2011", "-")  # gpt-oss writes non-breaking hyphens ("pre\u2011Vercel"); type a plain one
 
 
-def _race(msgs: list, words: int) -> str:
-    jobs = {_racers.submit(_ask, "api.cerebras.ai", "/v1/chat/completions", CEREBRAS_KEY, RACE_CEREBRAS_MODEL, msgs, words): "cerebras",
-            _racers.submit(_ask, "api.groq.com", "/openai/v1/chat/completions", GROQ_KEY, RACE_GROQ_MODEL, msgs, words): "groq"}
+def _race(msgs: list, words: int, racers: tuple) -> str:
+    jobs = {_racers.submit(_ask, host, path, key, extra, msgs, words): name for name, host, path, key, extra in racers}
     pending, errors = set(jobs), []
     while pending:
         done, pending = wait(pending, return_when=FIRST_COMPLETED)
@@ -328,7 +345,7 @@ def _race(msgs: list, words: int) -> str:
                 return f.result()
             except Exception as exc:
                 errors.append(f"{jobs[f]} {str(exc)[:100]}")
-    raise RuntimeError("both failed: " + "; ".join(errors))  # clean() then sends the raw transcript
+    raise RuntimeError("both failed: " + "; ".join(errors))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -365,7 +382,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
         stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
-        cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race"))       # ?cleanup=groq|surplus
+        cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace"))       # ?cleanup=groq|surplus
         t0 = time.monotonic()
         try:
             raw = transcribe(mp3, language, stt_route)
@@ -474,7 +491,7 @@ async def stream_handler(ws, path=None):
     language = q.get("language", ["en"])[0]
     roman = q.get("script", [""])[0] == "roman"
     stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
-    cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race"))
+    cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace"))
     audio = bytearray()
     try:
         async for msg in ws:

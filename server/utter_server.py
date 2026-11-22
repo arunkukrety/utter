@@ -245,8 +245,10 @@ def to_mp3(audio: bytes) -> bytes:
 STT_MODELS = {"openrouter": OPENROUTER_STT_MODEL, "cartesia": CARTESIA_STT_MODEL}  # others are set further down
 
 
-def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3", stt_model: str = "") -> str:
-    """stt_model picks the OpenRouter model (a plan's choice); empty means OPENROUTER_STT_MODEL."""
+def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3", stt_model: str = "",
+               stt_provider: str = "") -> str:
+    """stt_model picks the OpenRouter model (a plan's choice); empty means OPENROUTER_STT_MODEL. stt_provider is the
+    OpenRouter host to try first (others remain as fallbacks); empty lets OpenRouter choose."""
     t0 = time.monotonic()
     or_model = stt_model or OPENROUTER_STT_MODEL
     if route == "surplus" and fmt != "mp3":
@@ -290,7 +292,8 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
             return transcribe(mp3, language, "groq", fmt)
     elif route == "openrouter":
         o = "utter" + secrets.token_hex(8)
-        ofields = {"model": or_model, **({"language": "en"} if language != "multi" else {})}
+        ofields = {"model": or_model, **({"language": "en"} if language != "multi" else {}),
+                   **({"provider": json.dumps({"order": [stt_provider]})} if stt_provider else {})}
         obody = b"".join(f"--{o}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
                          for k, v in ofields.items())
         obody += (f"--{o}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
@@ -327,14 +330,14 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
 
 
 def routes_for(user: str, q: dict) -> tuple:
-    """(stt route, stt model, cleanup route). A user on a plan gets the plan's routes and nothing the request asks for,
-    so a free key can never pick a pricier route; the owner token and keys.json users may still choose with ?stt= and
-    ?cleanup=."""
+    """(stt route, stt model, cleanup route, stt provider). A user on a plan gets the plan's routes and nothing the
+    request asks for, so a free key can never pick a pricier route; the owner token and keys.json users may still choose
+    with ?stt= and ?cleanup=."""
     plan = accounts.route_for(user)
     if plan:
-        return "openrouter", plan[0], plan[1]
+        return "openrouter", plan[0], plan[1], plan[2]
     return (pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia")), "",
-            pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace")))
+            pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace")), "")
 
 
 def clean(text: str, provider: str = "groq", roman: bool = False) -> str:
@@ -514,10 +517,10 @@ class Handler(BaseHTTPRequestHandler):
         did = start_dictation(user)
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
-        stt_route, stt_model, cleaner = routes_for(user, q)
+        stt_route, stt_model, cleaner, stt_provider = routes_for(user, q)
         t0 = time.monotonic()
         try:
-            raw = transcribe(mp3, language, stt_route, "mp3", stt_model)
+            raw = transcribe(mp3, language, stt_route, "mp3", stt_model, stt_provider)
             t1 = time.monotonic()
             text = clean(raw, cleaner) if raw else ""
             t2 = time.monotonic()
@@ -585,10 +588,10 @@ def same_words(a: str, b: str) -> bool:
 
 
 async def finish_stream(ws, audio: bytes, language: str, stt_route: str, cleaner: str, roman: bool = False,
-                        stt_model: str = "") -> dict:
+                        stt_model: str = "", stt_provider: str = "") -> dict:
     """Scribe on the audio; meanwhile take the app's live transcript (if it sends one) and clean that early."""
     t0 = time.monotonic()
-    stt = asyncio.ensure_future(asyncio.to_thread(transcribe, audio, language, stt_route, "ogg", stt_model))
+    stt = asyncio.ensure_future(asyncio.to_thread(transcribe, audio, language, stt_route, "ogg", stt_model, stt_provider))
     early, live_text = None, ""
     while not stt.done():
         recv = asyncio.ensure_future(ws.recv())
@@ -633,7 +636,7 @@ async def stream_handler(ws, path=None):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(req_path).query)
     language = q.get("language", ["en"])[0]
     roman = q.get("script", [""])[0] == "roman"
-    stt_route, stt_model, cleaner = routes_for(user, q)
+    stt_route, stt_model, cleaner, stt_provider = routes_for(user, q)
     audio = bytearray()
     try:
         async for msg in ws:
@@ -659,7 +662,7 @@ async def stream_handler(ws, path=None):
                 script = "roman" if roman else "devanagari"
                 meta = {"user": user, "language": language, "script": script, "stt": stt_route, "cleanup": cleaner}
                 try:
-                    result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman, stt_model)
+                    result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman, stt_model, stt_provider)
                 except Exception as exc:
                     print(time.strftime("%H:%M:%S"), "stream failed:", str(exc)[:200], flush=True)
                     await ws.send(json.dumps({"error": "transcription failed"}))  # details stay in the log

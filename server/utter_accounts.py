@@ -59,9 +59,10 @@ def refresh() -> None:
     day = today()
     keys = {r["key_hash"]: r["user_id"] for r in _all("api_keys?select=key_hash,user_id&revoked_at=is.null")}
     profiles = _all("profiles?select=user_id,disabled,disabled_reason,"
-                    "plans(daily_dictations,daily_audio_seconds,stt_model,cleanup)")
+                    "plans(daily_dictations,daily_audio_seconds,stt_model,stt_provider,cleanup)")
     caps = {r["user_id"]: (r["plans"]["daily_dictations"], r["plans"]["daily_audio_seconds"]) for r in profiles}
-    routes = {r["user_id"]: (r["plans"]["stt_model"], r["plans"]["cleanup"]) for r in profiles}
+    routes = {r["user_id"]: (r["plans"]["stt_model"], r["plans"]["cleanup"], r["plans"]["stt_provider"] or "")
+              for r in profiles}
     blocked = {r["user_id"]: r["disabled_reason"] or "" for r in profiles if r["disabled"]}
     used = {r["user_id"]: [r["dictations"], float(r["audio_seconds"])]
             for r in _all(f"usage_daily?select=user_id,dictations,audio_seconds&day=eq.{day}")}
@@ -186,7 +187,8 @@ def user_for(key: str):
 
 
 def route_for(user: str):
-    """(stt model, cleanup route) from the user's plan, or None for users without one (the owner, keys.json)."""
+    """(stt model, cleanup route, stt provider or "") from the user's plan, or None for users without one (the owner,
+    keys.json)."""
     with _lock:
         return _routes.get(user)
 
@@ -270,7 +272,7 @@ if __name__ == "__main__":  # self-check, no network
     _keys[hashlib.sha256(b"utr_x").hexdigest()] = "u"
     assert user_for("utr_x") == "u" and user_for("utr_y") is None
     assert _seen == {hashlib.sha256(b"utr_x").hexdigest()}  # only a known key is stamped
-    _routes["u"], _blocked["u"] = ("openai/whisper-large-v3-turbo", "orrace"), "spam"
+    _routes["u"], _blocked["u"] = ("openai/whisper-large-v3-turbo", "orrace", "groq"), "spam"
     assert route_for("u")[0].startswith("openai/") and route_for("owner") is None
     assert blocked("u") == "This account is disabled: spam." and blocked("owner") is None
     print("ok")

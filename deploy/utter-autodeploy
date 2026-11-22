@@ -9,7 +9,7 @@ set -euo pipefail
 BRANCH=${UTTER_DEPLOY_BRANCH:-cross-platform-app}
 REPO=/opt/utter-deploy/repo
 STATE=/opt/utter-deploy/deployed
-FILES=(utter_server.py cleanup_prompt.txt hinglish_rule.txt)
+FILES=(utter_server.py utter_accounts.py cleanup_prompt.txt hinglish_rule.txt)
 declare -A WS_PORT=([a]=18191 [b]=28191)
 
 [ -d "$REPO/.git" ] || git clone -q --branch "$BRANCH" https://github.com/arunkukrety/utter.git "$REPO"

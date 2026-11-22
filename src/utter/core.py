@@ -182,7 +182,7 @@ class ServerStream:
     def __init__(self) -> None:
         self.url = setting("server_url") or SERVER_URL
         self.token = read_token()
-        self.ws, self.encoder, self.pump, self.sent, self.failed = None, None, None, 0, False
+        self.ws, self.encoder, self.pump, self.sent, self.failed, self.notice = None, None, None, 0, False, None
 
     def endpoint(self) -> str:
         language = "multi" if setting("language") == "multi" else "en"
@@ -242,6 +242,7 @@ class ServerStream:
             return None
         if reply.get("error") or not reply.get("text"):
             LOG(f"server returned no text ({reply.get('error', 'empty')})")
+            self.notice = reply.get("notice")  # something the user must see, e.g. the daily limit
             return None
         LOG(f"server: {(time.monotonic() - t) * 1000:.0f} ms after the stop ({self.sent // 1024} KB Opus streamed;"
             f" server stt {reply.get('stt_ms')} ms + cleanup {reply.get('cleanup_ms')} ms) | encoder flush"
@@ -357,6 +358,8 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
             popup.hide()
         elif cancelled:
             popup.message("Cancelled")
+        elif server.notice:
+            popup.message(server.notice)
         elif server.failed:
             popup.message("Couldn't reach Utter. Check your connection and try again.")
         elif setting("language") != "multi" and popup.heard_speech():

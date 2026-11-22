@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from urllib.parse import parse_qs, urlparse
 
+import utter_accounts as accounts
+
 ELEVENLABS_KEY = os.environ["ELEVENLABS_KEY"]
 GROQ_KEY = os.environ["GROQ_KEY"]
 # cleanup on Cerebras: 154 ms median vs Groq 258 ms (10 runs from this VPS, 2026-11-16); falls back to Groq
@@ -53,10 +55,10 @@ RACE_CEREBRAS_MODEL = os.environ.get("RACE_CEREBRAS_MODEL", "gpt-oss-120b")
 RACE_GROQ_MODEL = os.environ.get("RACE_GROQ_MODEL", "openai/gpt-oss-120b")
 
 
-# Every dictation is kept: <day>/<HHMMSS>-<id>.<ogg|mp3> (the audio as received) and a .json beside it with the
+# When on, every dictation is kept: <day>/<HHMMSS>-<id>.<ogg|mp3> (the audio as received) and a .json beside it with the
 # transcript before and after cleanup. Days and times are UTC. The folder is the service's private state directory
-# (systemd StateDirectory, 0700). UTTER_SAVE_DICTATIONS=0 turns it off.
-SAVE_DICTATIONS = os.environ.get("UTTER_SAVE_DICTATIONS", "1") != "0"
+# (systemd StateDirectory, 0700). Off by default; UTTER_SAVE_DICTATIONS=1 turns it on (debugging).
+SAVE_DICTATIONS = os.environ.get("UTTER_SAVE_DICTATIONS", "0") == "1"  # off unless asked for: dictations are private
 DICTATIONS = os.path.join(os.environ.get("STATE_DIRECTORY") or "/var/lib/utter-server", "dictations")
 
 
@@ -102,7 +104,9 @@ def key_owner(authorization: str):
     except (OSError, ValueError):
         pass  # no keys file yet, or a half-written one: keep what was loaded last
     entry = _keys["data"].get(hashlib.sha256(key.encode()).hexdigest())
-    return entry["name"] if entry and not entry.get("revoked") else None
+    if entry:
+        return entry["name"] if not entry.get("revoked") else None
+    return accounts.user_for(key)  # a Supabase account's key: its user id
 
 
 def pick(q: dict, name: str, default: str, allowed: tuple) -> str:
@@ -366,7 +370,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if urlparse(self.path).path == "/health":
-            ok = READY.is_set() and not DRAINING.is_set()
+            ok = READY.is_set() and accounts.ready() and not DRAINING.is_set()
             return self.reply(200 if ok else 503, {"ok": ok})
         self.reply(404, {"error": "not found"})
 
@@ -377,6 +381,9 @@ class Handler(BaseHTTPRequestHandler):
         user = key_owner(self.headers.get("Authorization", ""))
         if not user:
             return self.reply(401, {"error": "bad token"})
+        notice = accounts.over_limit(user)
+        if notice:
+            return self.reply(429, {"error": "daily limit reached", "notice": notice})
         length = int(self.headers.get("Content-Length") or 0)
         if not 0 < length <= MAX_AUDIO:
             return self.reply(413 if length else 400, {"error": "send the recording as an MP3 body"})
@@ -396,6 +403,7 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(502, {"error": "transcription failed"})
             return save_dictation(mp3, "mp3", {"user": user, "language": language, "stt": stt_route, "cleanup": cleaner,
                                                "error": str(exc)[:500]})
+        accounts.record(user, accounts.audio_seconds(mp3, "mp3"))
         stt_ms, clean_ms = (t1 - t0) * 1000, (t2 - t1) * 1000
         self.log_message("dictate: %d KB audio, stt %.0f ms, cleanup %.0f ms", length // 1024, stt_ms, clean_ms)
         self.reply(200, {"text": text or raw, "raw": raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
@@ -513,6 +521,10 @@ async def stream_handler(ws, path=None):
                 if not audio:
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "no audio"}))
                     return
+                notice = accounts.over_limit(user)
+                if notice:  # checked before any provider is paid; the app shows the notice
+                    await ws.send(json.dumps({"text": "", "raw": "", "error": "daily limit reached", "notice": notice}))
+                    return
                 meta = {"user": user, "language": language, "script": "roman" if roman else "devanagari", "stt": stt_route,
                         "cleanup": cleaner}
                 try:
@@ -522,6 +534,7 @@ async def stream_handler(ws, path=None):
                     await ws.send(json.dumps({"error": "transcription failed"}))  # details stay in the log
                     await asyncio.to_thread(save_dictation, bytes(audio), "ogg", {**meta, "error": str(exc)[:500]})
                     return
+                accounts.record(user, accounts.audio_seconds(bytes(audio), "ogg"))
                 print(time.strftime("%H:%M:%S"), f"stream: {len(audio) // 1024} KB opus, stt {result['stt_ms']} ms, "
                       f"cleanup {result['cleanup_ms']} ms{' (head start used)' if result['head_start'] else ''}",
                       flush=True)
@@ -543,7 +556,7 @@ _busy = set()  # connections with a dictation in flight
 async def ws_health(path, headers):
     """GET /health on the WebSocket port, for the proxy's health check: 200 only when warm and not draining."""
     if path.split("?")[0] == "/health":
-        ok = READY.is_set() and not DRAINING.is_set()
+        ok = READY.is_set() and accounts.ready() and not DRAINING.is_set()
         return HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE, [("Content-Type", "text/plain")], b"ok\n" if ok else b"not ready\n"
     return None
 
@@ -573,6 +586,7 @@ async def serve_ws(http_server):
 
 if __name__ == "__main__":
     threading.Thread(target=keep_warm, daemon=True).start()
+    accounts.start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"utter-server on 127.0.0.1:{PORT} (stt {DEFAULT_STT}, cleanup {DEFAULT_CLEANUP})", flush=True)

@@ -4,3 +4,4 @@ variants/
 *.key
 build/
 dist/
+supabase/.temp/

@@ -20,7 +20,7 @@ _lock = threading.Lock()
 _keys = {}     # sha256(key) -> user id
 _caps = {}     # user id -> (daily dictations, daily audio seconds)
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
-_pending = {}  # (user id, day) -> [dictations, seconds] counted here and not yet written
+_pending = {}  # (user id, day) -> [dictations, seconds, cost µ$] counted here and not yet written
 LOADED = threading.Event()
 
 
@@ -65,12 +65,13 @@ def refresh() -> None:
 def flush() -> None:
     with _lock:
         batch = dict(_pending)
-    for (user, day), (n, secs) in batch.items():
-        row = _rest("POST", "rpc/add_usage", {"p_user": user, "p_day": day, "p_dictations": n, "p_seconds": secs})[0]
+    for (user, day), (n, secs, cost) in batch.items():
+        row = _rest("POST", "rpc/add_usage", {"p_user": user, "p_day": day, "p_dictations": n, "p_seconds": secs,
+                                              "p_cost_micro": cost})[0]
         with _lock:
             left = _pending[(user, day)]
-            left[0] -= n; left[1] -= secs  # more may have been counted while this was in flight
-            if left[0] <= 0 and left[1] <= 0:
+            left[0] -= n; left[1] -= secs; left[2] -= cost  # more may have been counted while this was in flight
+            if left[0] <= 0 and left[1] <= 0 and left[2] <= 0:
                 del _pending[(user, day)]
             if day == today():
                 _used[user] = [row["dictations"], float(row["audio_seconds"])]
@@ -79,13 +80,17 @@ def flush() -> None:
 def _loop() -> None:
     last_refresh = 0.0
     while True:
+        # Separately, so a write that keeps failing can never stop keys, revocations and plans from refreshing.
         try:
             flush()
-            if time.monotonic() - last_refresh >= REFRESH_S:
+        except Exception as exc:  # Supabase down or slow: keep counting in memory, try again next round
+            print(time.strftime("%H:%M:%S"), f"accounts: usage write failed ({str(exc)[:150]})", flush=True)
+        if time.monotonic() - last_refresh >= REFRESH_S:
+            try:
                 refresh()
                 last_refresh = time.monotonic()
-        except Exception as exc:  # Supabase down or slow: keep serving from memory, try again next round
-            print(time.strftime("%H:%M:%S"), f"accounts: sync failed ({str(exc)[:150]})", flush=True)
+            except Exception as exc:  # keep serving from the last copy
+                print(time.strftime("%H:%M:%S"), f"accounts: refresh failed ({str(exc)[:150]})", flush=True)
         time.sleep(FLUSH_S)
 
 
@@ -124,12 +129,24 @@ def over_limit(user: str):
     return None
 
 
-def record(user: str, seconds: float) -> None:
+def _count(user: str, n: int, seconds: float, cost: int) -> None:
     if not ENABLED:
         return
     with _lock:
-        p = _pending.setdefault((user, today()), [0, 0.0])
-        p[0] += 1; p[1] += round(seconds, 1)
+        if user not in _caps:  # the owner token and keys.json users are not Supabase accounts: nothing to write
+            return
+        p = _pending.setdefault((user, today()), [0, 0.0, 0])
+        p[0] += n; p[1] += round(seconds, 1); p[2] += cost
+
+
+def record(user: str, seconds: float) -> None:
+    """One finished dictation of this length."""
+    _count(user, 1, seconds, 0)
+
+
+def add_cost(user: str, micro: int) -> None:
+    """Provider cost in microdollars, whenever it is known (a race's loser reports after the dictation is done)."""
+    _count(user, 0, 0.0, micro)
 
 
 def audio_seconds(data: bytes, fmt: str) -> float:
@@ -151,6 +168,8 @@ if __name__ == "__main__":  # self-check, no network
     assert over_limit("u") is None
     record("u", 5)
     assert over_limit("u") and over_limit("nobody") is None
+    add_cost("u", 39); record("owner", 5); add_cost("owner", 1)
+    assert _pending == {("u", today()): [1, 5.0, 39]}  # non-Supabase users are never queued for a write
     _keys[hashlib.sha256(b"utr_x").hexdigest()] = "u"
     assert user_for("utr_x") == "u" and user_for("utr_y") is None
     print("ok")

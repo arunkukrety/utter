@@ -16,7 +16,7 @@ Standard library only. Listens on 127.0.0.1; a Cloudflare tunnel puts HTTPS in f
 from the environment (systemd EnvironmentFile), never from the request. Provider connections are kept open and reused,
 so a request pays no handshake to ElevenLabs or Groq.
 """
-import re, asyncio, hashlib, http.client, json, os, secrets, subprocess, threading, time
+import re, asyncio, contextvars, hashlib, http.client, json, os, secrets, subprocess, threading, time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -35,6 +35,19 @@ CARTESIA_KEY = os.environ.get("CARTESIA_KEY", "")
 CARTESIA_STT_MODEL = os.environ.get("CARTESIA_STT_MODEL", "ink-whisper")  # Whisper-based; ~146 ms batch from here
 # AssemblyAI through OpenRouter: ~100 ms from here, billed per audio second with no minimum (measured 2026-11-14)
 OPENROUTER_STT_MODEL = os.environ.get("OPENROUTER_STT_MODEL", "assemblyai/universal-3-5-pro")
+# Our AssemblyAI key is BYOK on OpenRouter, so its usage.cost reads 0 and AssemblyAI bills us directly: $0.21 an hour
+# for universal-3-5-pro (2026-11-16). Used only when OpenRouter reports no cost.
+OPENROUTER_STT_USD_PER_HOUR = float(os.environ.get("OPENROUTER_STT_USD_PER_HOUR", "0.21"))
+
+# What the current dictation's provider calls cost: a callable taking microdollars, set per dictation. Threads started
+# for it (asyncio.to_thread, the race) carry it along, so a race's loser that finishes later is still charged.
+_bill = contextvars.ContextVar("bill", default=None)
+
+
+def charge(usd) -> None:
+    f = _bill.get()
+    if f and usd:
+        f(round(float(usd) * 1_000_000))
 # cleanup through OpenRouter, pinned to one provider (its capacity, not our Groq free-tier limit): 178 ms median
 OPENROUTER_CLEANUP_MODEL = os.environ.get("OPENROUTER_CLEANUP_MODEL", "meta-llama/llama-3.1-8b-instruct")
 OPENROUTER_CLEANUP_PROVIDER = os.environ.get("OPENROUTER_CLEANUP_PROVIDER", "groq")
@@ -248,7 +261,11 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
                             {"xi-api-key": ELEVENLABS_KEY, "Content-Type": f"multipart/form-data; boundary={b}"})
     if status != 200:
         raise RuntimeError(f"transcription ({route}) HTTP {status}: {data[:200]!r}")
-    return json.loads(data).get("text", "").strip()
+    reply = json.loads(data)
+    if route == "openrouter":
+        usage = reply.get("usage") or {}
+        charge(usage.get("cost") or (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600)
+    return reply.get("text", "").strip()
 
 
 def clean(text: str, provider: str = "groq", roman: bool = False) -> str:
@@ -312,7 +329,9 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
                             {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}, CLEANUP_TIMEOUT_S)
     if status != 200:
         raise RuntimeError(f"cleanup ({provider}) HTTP {status}: {data[:200]!r}")
-    return (json.loads(data)["choices"][0]["message"]["content"] or "").strip()
+    reply = json.loads(data)
+    charge((reply.get("usage") or {}).get("cost"))  # OpenRouter reports it; our own Groq/Cerebras keys do not
+    return (reply["choices"][0]["message"]["content"] or "").strip()
 
 
 _racers = ThreadPoolExecutor(max_workers=8)  # the loser keeps running to its timeout, then hands its socket back
@@ -334,14 +353,17 @@ def _ask(host: str, path: str, key: str, extra: dict, msgs: list, words: int) ->
                         CLEANUP_TIMEOUT_S)
     if status != 200:
         raise RuntimeError(f"HTTP {status}: {data[:120]!r}")
-    out = (json.loads(data)["choices"][0]["message"]["content"] or "").strip()
+    reply = json.loads(data)
+    charge((reply.get("usage") or {}).get("cost"))  # both sides of a race are billed, the loser too
+    out = (reply["choices"][0]["message"]["content"] or "").strip()
     if not out:  # reasoning used up max_tokens: let the other provider answer
         raise RuntimeError("empty answer")
     return out.replace("\u2011", "-")  # gpt-oss writes non-breaking hyphens ("pre\u2011Vercel"); type a plain one
 
 
 def _race(msgs: list, words: int, racers: tuple) -> str:
-    jobs = {_racers.submit(_ask, host, path, key, extra, msgs, words): name for name, host, path, key, extra in racers}
+    jobs = {_racers.submit(contextvars.copy_context().run, _ask, host, path, key, extra, msgs, words): name
+            for name, host, path, key, extra in racers}
     pending, errors = set(jobs), []
     while pending:
         done, pending = wait(pending, return_when=FIRST_COMPLETED)
@@ -390,6 +412,7 @@ class Handler(BaseHTTPRequestHandler):
         notice = accounts.over_limit(user)
         if notice:
             return self.reply(429, {"error": "daily limit reached", "notice": notice})
+        _bill.set(lambda micro: accounts.add_cost(user, micro))
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
         stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
@@ -527,6 +550,7 @@ async def stream_handler(ws, path=None):
                 if notice:  # checked before any provider is paid; the app shows the notice
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "daily limit reached", "notice": notice}))
                     return
+                _bill.set(lambda micro: accounts.add_cost(user, micro))  # the threads below inherit it
                 meta = {"user": user, "language": language, "script": "roman" if roman else "devanagari", "stt": stt_route,
                         "cleanup": cleaner}
                 try:

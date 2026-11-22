@@ -44,12 +44,53 @@ OPENROUTER_STT_USD_PER_HOUR = float(os.environ.get("OPENROUTER_STT_USD_PER_HOUR"
 # Parts (accounts.PARTS): "stt" (AssemblyAI), "cleanup_model1" and "cleanup_model2" (the first and second racer of a
 # cleanup race, whatever model or provider each is), "other" (any other paid cleanup call).
 _bill = contextvars.ContextVar("bill", default=None)
+_dictation = contextvars.ContextVar("dictation", default=None)  # (user, dictation id) for the call log
 
 
-def charge(usd, part: str) -> None:
+def charge(usd, part: str) -> int:
     f = _bill.get()
-    if f and usd:
-        f(part, round(float(usd) * 1_000_000))
+    micro = round(float(usd or 0) * 1_000_000)
+    if f and micro:
+        f(part, micro)
+    return micro
+
+
+def start_dictation(user: str) -> str:
+    """Bill this dictation's provider calls to the user and tag their call-log rows; the id ties them together."""
+    did = secrets.token_hex(8)
+    _bill.set(lambda part, micro: accounts.add_cost(user, part, micro))
+    _dictation.set((user, did))
+    return did
+
+
+def log_call(part: str, model: str, provider: str, t0: float, status: int, reply=None, error: str = "",
+             cost_micro: int = 0, won=None) -> None:
+    """One provider call for later analysis (provider_calls): timing, outcome, cost, tokens. Never any text."""
+    d = _dictation.get()
+    if not d:
+        return
+    usage = (reply or {}).get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    accounts.log("provider_calls", d[0], {
+        "at": accounts.now_iso(), "dictation_id": d[1], "part": part, "model": model, "provider": provider,
+        "upstream": (reply or {}).get("provider"), "ms": round((time.monotonic() - t0) * 1000),
+        "ok": status == 200 and not error,
+        "http_status": status or None, "error": error[:300] or None, "won": won, "cost_micro": cost_micro,
+        "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": details.get("reasoning_tokens"), "audio_seconds": usage.get("seconds")})
+
+
+def log_dictation(did: str, user: str, audio: bytes, fmt: str, language: str, script: str, stt_route: str,
+                  cleaner: str, result=None, error: str = "") -> None:
+    """One dictation's summary for later analysis (dictations): routes, sizes, timings, outcome. Never any text."""
+    r = result or {}
+    accounts.log("dictations", user, {
+        "id": did, "at": accounts.now_iso(), "language": language, "script": script, "stt_route": stt_route,
+        "cleanup_route": cleaner, "audio_seconds": round(accounts.audio_seconds(audio, fmt), 2),
+        "upload_kb": len(audio) // 1024, "stt_ms": r.get("stt_ms"), "cleanup_ms": r.get("cleanup_ms"),
+        "total_ms": r.get("total_ms"), "head_start": r.get("head_start"),
+        "raw_chars": len(r["raw"]) if "raw" in r else None, "text_chars": len(r["text"]) if "text" in r else None,
+        "ok": not error, "error": error[:300] or None})
 # cleanup through OpenRouter, pinned to one provider (its capacity, not our Groq free-tier limit): 178 ms median
 OPENROUTER_CLEANUP_MODEL = os.environ.get("OPENROUTER_CLEANUP_MODEL", "meta-llama/llama-3.1-8b-instruct")
 OPENROUTER_CLEANUP_PROVIDER = os.environ.get("OPENROUTER_CLEANUP_PROVIDER", "groq")
@@ -201,7 +242,11 @@ def to_mp3(audio: bytes) -> bytes:
                            "pipe:1"], input=audio, capture_output=True, timeout=20).stdout
 
 
+STT_MODELS = {"openrouter": OPENROUTER_STT_MODEL, "cartesia": CARTESIA_STT_MODEL}  # others are set further down
+
+
 def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3") -> str:
+    t0 = time.monotonic()
     if route == "surplus" and fmt != "mp3":
         mp3, fmt = to_mp3(mp3), "mp3"
     filename, ctype = ("dictation.ogg", "audio/ogg") if fmt == "ogg" else ("dictation.mp3", "audio/mpeg")
@@ -239,6 +284,7 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
             status, data = 0, str(exc).encode()
         if status != 200:  # Cartesia is down or refused: the dictation still gets Groq Whisper
             print(time.strftime("%H:%M:%S"), f"cartesia stt failed ({status} {data[:120]!r}); using groq", flush=True)
+            log_call("stt", CARTESIA_STT_MODEL, "cartesia", t0, status, error=data[:300].decode(errors="replace"))
             return transcribe(mp3, language, "groq", fmt)
     elif route == "openrouter":
         o = "utter" + secrets.token_hex(8)
@@ -254,6 +300,7 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
             status, data = 0, str(exc).encode()
         if status != 200:  # OpenRouter or AssemblyAI is down: the dictation still gets Groq Whisper
             print(time.strftime("%H:%M:%S"), f"openrouter stt failed ({status} {data[:120]!r}); using groq", flush=True)
+            log_call("stt", OPENROUTER_STT_MODEL, "openrouter", t0, status, error=data[:300].decode(errors="replace"))
             return transcribe(mp3, language, "groq", fmt)
     elif route == "surplus":  # the same Scribe v2, through the Surplus key market
         status, data = call("api.surplusintelligence.ai", "POST", "/v1/resources/elevenlabs/v1/speech-to-text", body,
@@ -261,12 +308,16 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
     else:
         status, data = call("api.elevenlabs.io", "POST", "/v1/speech-to-text", body,
                             {"xi-api-key": ELEVENLABS_KEY, "Content-Type": f"multipart/form-data; boundary={b}"})
+    model = STT_MODELS.get(route) or (GROQ_STT_MODEL if route == "groq" else SCRIBE_MODEL)
     if status != 200:
+        log_call("stt", model, route, t0, status, error=data[:300].decode(errors="replace"))
         raise RuntimeError(f"transcription ({route}) HTTP {status}: {data[:200]!r}")
     reply = json.loads(data)
+    cost = 0
     if route == "openrouter":
         usage = reply.get("usage") or {}
-        charge(usage.get("cost") or (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600, "stt")
+        cost = charge(usage.get("cost") or (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600, "stt")
+    log_call("stt", model, route, t0, status, reply, cost_micro=cost)
     return reply.get("text", "").strip()
 
 
@@ -283,6 +334,7 @@ URDU_SCRIPT = re.compile(r"[\u0600-\u06ff]")  # AssemblyAI with no language hint
 
 
 def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
+    t0 = time.monotonic()
     prompt = CLEANUP_PROMPT_ROMAN if roman else CLEANUP_PROMPT
     if URDU_SCRIPT.search(text):  # the general prompt rule alone was ignored on short sentences; say it for this one
         prompt += ("\nThis text is Hindi that the transcriber wrote in Urdu script. Write it in "
@@ -312,6 +364,7 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
             status, data = 0, str(exc).encode()
         if status != 200:  # Cerebras down, throttling or stalled: clean on Groq instead
             print(time.strftime("%H:%M:%S"), f"cerebras cleanup failed ({status} {data[:120]!r}); using groq", flush=True)
+            log_call("other", CEREBRAS_CLEANUP_MODEL, "cerebras", t0, status, error=data[:300].decode(errors="replace"))
             return _clean(text, "groq", roman)
     elif provider == "openrouter":
         body = json.dumps({"model": OPENROUTER_CLEANUP_MODEL, "temperature": 0, "max_tokens": 2 * len(text.split()) + 512,
@@ -323,16 +376,22 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
             status, data = 0, str(exc).encode()
         if status != 200:  # OpenRouter or its provider is down or throttling: clean on our own Groq instead
             print(time.strftime("%H:%M:%S"), f"openrouter cleanup failed ({status} {data[:120]!r}); using groq", flush=True)
+            log_call("other", OPENROUTER_CLEANUP_MODEL, "openrouter", t0, status,
+                     error=data[:300].decode(errors="replace"))
             return _clean(text, "groq", roman)
     else:
         body = json.dumps({"model": CLEANUP_MODEL, "temperature": 0, "max_tokens": 2 * len(text.split()) + 512,
                            "messages": msgs, **CLEANUP_EXTRA}).encode()
         status, data = call("api.groq.com", "POST", "/openai/v1/chat/completions", body,
                             {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}, CLEANUP_TIMEOUT_S)
+    model = {"surplus": SURPLUS_CLEANUP_MODEL, "cerebras": CEREBRAS_CLEANUP_MODEL,
+             "openrouter": OPENROUTER_CLEANUP_MODEL}.get(provider, CLEANUP_MODEL)
     if status != 200:
+        log_call("other", model, provider, t0, status, error=data[:300].decode(errors="replace"))
         raise RuntimeError(f"cleanup ({provider}) HTTP {status}: {data[:200]!r}")
     reply = json.loads(data)
-    charge((reply.get("usage") or {}).get("cost"), "other")  # OpenRouter reports it; our own Groq/Cerebras keys do not
+    cost = charge((reply.get("usage") or {}).get("cost"), "other")  # OpenRouter reports it; our own keys do not
+    log_call("other", model, provider, t0, status, reply, cost_micro=cost)
     return (reply["choices"][0]["message"]["content"] or "").strip()
 
 
@@ -356,23 +415,34 @@ def openrouter_racers() -> tuple:
                  for model, provider in (accounts.cleanup_models() or DEFAULT_CLEANUP_MODELS))
 
 
-def _ask(part: str, host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:
+def _ask(part: str, name: str, race: dict, host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:
+    model, provider = extra.get("model", ""), (extra.get("provider") or {}).get("only", [name])[0]
     body = json.dumps({"temperature": 0, "max_tokens": 2 * words + 512, "messages": msgs, **extra}).encode()
-    status, data = call(host, "POST", path, body, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        CLEANUP_TIMEOUT_S)
+    t0 = time.monotonic()
+    try:
+        status, data = call(host, "POST", path, body,
+                            {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, CLEANUP_TIMEOUT_S)
+    except Exception as exc:  # timed out or the connection failed
+        log_call(part, model, provider, t0, 0, error=str(exc), won=False)
+        raise
     if status != 200:
+        log_call(part, model, provider, t0, status, error=data[:300].decode(errors="replace"), won=False)
         raise RuntimeError(f"HTTP {status}: {data[:120]!r}")
     reply = json.loads(data)
-    charge((reply.get("usage") or {}).get("cost"), part)  # both sides of a race are billed, the loser too
+    cost = charge((reply.get("usage") or {}).get("cost"), part)  # both sides of a race are billed, the loser too
     out = (reply["choices"][0]["message"]["content"] or "").strip()
     if not out:  # reasoning used up max_tokens: let the other provider answer
+        log_call(part, model, provider, t0, status, reply, error="empty answer", cost_micro=cost, won=False)
         raise RuntimeError("empty answer")
+    won = race.setdefault("winner", part) == part  # the first good answer is the one the race returns
+    log_call(part, model, provider, t0, status, reply, cost_micro=cost, won=won)
     return out.replace("\u2011", "-")  # gpt-oss writes non-breaking hyphens ("pre\u2011Vercel"); type a plain one
 
 
 def _race(msgs: list, words: int, racers: tuple) -> str:
-    jobs = {_racers.submit(contextvars.copy_context().run, _ask, f"cleanup_model{i}", host, path, key, extra, msgs,
-                           words): name
+    race = {}  # the first racer to answer well claims "winner" here, for the call log
+    jobs = {_racers.submit(contextvars.copy_context().run, _ask, f"cleanup_model{i}", name, race, host, path, key, extra,
+                           msgs, words): name
             for i, (name, host, path, key, extra) in enumerate(racers, 1)}  # billed by slot, so a model swap keeps columns
     pending, errors = set(jobs), []
     while pending:
@@ -422,7 +492,7 @@ class Handler(BaseHTTPRequestHandler):
         notice = accounts.over_limit(user)
         if notice:
             return self.reply(429, {"error": "daily limit reached", "notice": notice})
-        _bill.set(lambda part, micro: accounts.add_cost(user, part, micro))
+        did = start_dictation(user)
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
         stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
@@ -436,13 +506,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.log_message("dictate failed: %s", str(exc)[:200])
             self.reply(502, {"error": "transcription failed"})
+            log_dictation(did, user, mp3, "mp3", language, "", stt_route, cleaner, error=str(exc))
             return save_dictation(mp3, "mp3", {"user": user, "language": language, "stt": stt_route, "cleanup": cleaner,
                                                "error": str(exc)[:500]})
         accounts.record(user, accounts.audio_seconds(mp3, "mp3"))
         stt_ms, clean_ms = (t1 - t0) * 1000, (t2 - t1) * 1000
         self.log_message("dictate: %d KB audio, stt %.0f ms, cleanup %.0f ms", length // 1024, stt_ms, clean_ms)
-        self.reply(200, {"text": text or raw, "raw": raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
-                         "total_ms": round(stt_ms + clean_ms)})
+        result = {"text": text or raw, "raw": raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
+                  "total_ms": round(stt_ms + clean_ms)}
+        self.reply(200, result)
+        log_dictation(did, user, mp3, "mp3", language, "", stt_route, cleaner, result)
         save_dictation(mp3, "mp3", {"user": user, "language": language, "stt": stt_route, "cleanup": cleaner, "raw": raw,
                                     "text": text or raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
                                     "total_ms": round(stt_ms + clean_ms)})
@@ -560,17 +633,19 @@ async def stream_handler(ws, path=None):
                 if notice:  # checked before any provider is paid; the app shows the notice
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "daily limit reached", "notice": notice}))
                     return
-                _bill.set(lambda part, micro: accounts.add_cost(user, part, micro))  # the threads below inherit it
-                meta = {"user": user, "language": language, "script": "roman" if roman else "devanagari", "stt": stt_route,
-                        "cleanup": cleaner}
+                did = start_dictation(user)  # the threads below inherit its bill and call-log tag
+                script = "roman" if roman else "devanagari"
+                meta = {"user": user, "language": language, "script": script, "stt": stt_route, "cleanup": cleaner}
                 try:
                     result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman)
                 except Exception as exc:
                     print(time.strftime("%H:%M:%S"), "stream failed:", str(exc)[:200], flush=True)
                     await ws.send(json.dumps({"error": "transcription failed"}))  # details stay in the log
+                    log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, cleaner, error=str(exc))
                     await asyncio.to_thread(save_dictation, bytes(audio), "ogg", {**meta, "error": str(exc)[:500]})
                     return
                 accounts.record(user, accounts.audio_seconds(bytes(audio), "ogg"))
+                log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, cleaner, result)
                 print(time.strftime("%H:%M:%S"), f"stream: {len(audio) // 1024} KB opus, stt {result['stt_ms']} ms, "
                       f"cleanup {result['cleanup_ms']} ms{' (head start used)' if result['head_start'] else ''}",
                       flush=True)

@@ -21,6 +21,8 @@ _keys = {}     # sha256(key) -> user id
 _caps = {}     # user id -> (daily dictations, daily audio seconds)
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
 _models = []   # [(model, provider)] for cleanup slots 1, 2, from public.cleanup_models; empty = the server's defaults
+_logs = {"dictations": [], "provider_calls": []}  # analysis rows waiting to be written, oldest first
+LOG_CAP = 20000  # per table: if Supabase stays down, the oldest rows are dropped rather than memory growing
 PARTS = ("stt", "cleanup_model1", "cleanup_model2", "other")  # cost parts, each its own usage_daily column: <part>_micro
 _pending = {}  # (user id, day) -> [dictations, seconds, µ$ per part in PARTS order...] counted here and not yet written
 LOADED = threading.Event()
@@ -86,6 +88,40 @@ def flush() -> None:
                 _used[user] = [row["dictations"], float(row["audio_seconds"])]
 
 
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def log(table: str, user: str, row: dict) -> None:
+    """Queue an analysis row. Supabase accounts get user_id; the owner token and keys.json users get user_label."""
+    if not ENABLED:
+        return
+    with _lock:
+        supa = user in _caps
+        rows = _logs[table]
+        rows.append({**row, "user_id": user if supa else None, "user_label": None if supa else user})
+        del rows[:-LOG_CAP]
+
+
+def flush_logs() -> None:
+    for table in _logs:
+        with _lock:
+            rows, _logs[table] = _logs[table], []
+        if not rows:
+            continue
+        try:  # one bulk insert per table; every row of a table has the same keys
+            req = urllib.request.Request(f"{URL}/rest/v1/{table}", method="POST", data=json.dumps(rows).encode(),
+                                         headers={"apikey": SECRET, "Content-Type": "application/json",
+                                                  "Prefer": "return=minimal",
+                                                  **({"Authorization": "Bearer " + SECRET} if SECRET.startswith("eyJ") else {})})
+            urllib.request.urlopen(req, timeout=10).close()
+        except Exception:
+            with _lock:  # put them back in front of anything newer, and try again next round
+                _logs[table][:0] = rows
+                del _logs[table][:-LOG_CAP]
+            raise
+
+
 def _loop() -> None:
     last_refresh = 0.0
     while True:
@@ -94,6 +130,10 @@ def _loop() -> None:
             flush()
         except Exception as exc:  # Supabase down or slow: keep counting in memory, try again next round
             print(time.strftime("%H:%M:%S"), f"accounts: usage write failed ({str(exc)[:150]})", flush=True)
+        try:
+            flush_logs()
+        except Exception as exc:
+            print(time.strftime("%H:%M:%S"), f"accounts: log write failed ({str(exc)[:150]})", flush=True)
         if time.monotonic() - last_refresh >= REFRESH_S:
             try:
                 refresh()
@@ -189,6 +229,9 @@ if __name__ == "__main__":  # self-check, no network
     add_cost("u", "x", 2)
     record("owner", 5); add_cost("owner", "stt", 1)
     assert _pending == {("u", today()): [1, 5.0, 321, 40, 39, 2]}  # non-Supabase users are never queued for a write
+    log("dictations", "u", {"id": "a"}); log("dictations", "owner", {"id": "b"})
+    assert _logs["dictations"] == [{"id": "a", "user_id": "u", "user_label": None},
+                                   {"id": "b", "user_id": None, "user_label": "owner"}]  # the owner IS logged, by label
     _keys[hashlib.sha256(b"utr_x").hexdigest()] = "u"
     assert user_for("utr_x") == "u" and user_for("utr_y") is None
     print("ok")

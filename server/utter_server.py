@@ -39,15 +39,17 @@ OPENROUTER_STT_MODEL = os.environ.get("OPENROUTER_STT_MODEL", "assemblyai/univer
 # for universal-3-5-pro (2026-11-16). Used only when OpenRouter reports no cost.
 OPENROUTER_STT_USD_PER_HOUR = float(os.environ.get("OPENROUTER_STT_USD_PER_HOUR", "0.21"))
 
-# What the current dictation's provider calls cost: a callable taking microdollars, set per dictation. Threads started
-# for it (asyncio.to_thread, the race) carry it along, so a race's loser that finishes later is still charged.
+# What the current dictation's provider calls cost: a callable taking (part, microdollars), set per dictation. Threads
+# started for it (asyncio.to_thread, the race) carry it along, so a race's loser that finishes later is still charged.
+# Parts (accounts.PARTS): "stt" (AssemblyAI), "cerebras" and "groq" (the two sides of a cleanup race), "other" (any
+# other paid cleanup call).
 _bill = contextvars.ContextVar("bill", default=None)
 
 
-def charge(usd) -> None:
+def charge(usd, part: str) -> None:
     f = _bill.get()
     if f and usd:
-        f(round(float(usd) * 1_000_000))
+        f(part, round(float(usd) * 1_000_000))
 # cleanup through OpenRouter, pinned to one provider (its capacity, not our Groq free-tier limit): 178 ms median
 OPENROUTER_CLEANUP_MODEL = os.environ.get("OPENROUTER_CLEANUP_MODEL", "meta-llama/llama-3.1-8b-instruct")
 OPENROUTER_CLEANUP_PROVIDER = os.environ.get("OPENROUTER_CLEANUP_PROVIDER", "groq")
@@ -264,7 +266,7 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
     reply = json.loads(data)
     if route == "openrouter":
         usage = reply.get("usage") or {}
-        charge(usage.get("cost") or (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600)
+        charge(usage.get("cost") or (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600, "stt")
     return reply.get("text", "").strip()
 
 
@@ -330,7 +332,7 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     if status != 200:
         raise RuntimeError(f"cleanup ({provider}) HTTP {status}: {data[:200]!r}")
     reply = json.loads(data)
-    charge((reply.get("usage") or {}).get("cost"))  # OpenRouter reports it; our own Groq/Cerebras keys do not
+    charge((reply.get("usage") or {}).get("cost"), "other")  # OpenRouter reports it; our own Groq/Cerebras keys do not
     return (reply["choices"][0]["message"]["content"] or "").strip()
 
 
@@ -347,14 +349,14 @@ OPENROUTER_RACERS = tuple((p, "openrouter.ai", "/api/v1/chat/completions", OPENR
                             "provider": {"only": [p], "allow_fallbacks": False}}) for p in ("cerebras", "groq"))
 
 
-def _ask(host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:
+def _ask(name: str, host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:
     body = json.dumps({"temperature": 0, "max_tokens": 2 * words + 512, "messages": msgs, **extra}).encode()
     status, data = call(host, "POST", path, body, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                         CLEANUP_TIMEOUT_S)
     if status != 200:
         raise RuntimeError(f"HTTP {status}: {data[:120]!r}")
     reply = json.loads(data)
-    charge((reply.get("usage") or {}).get("cost"))  # both sides of a race are billed, the loser too
+    charge((reply.get("usage") or {}).get("cost"), name)  # both sides of a race are billed, the loser too
     out = (reply["choices"][0]["message"]["content"] or "").strip()
     if not out:  # reasoning used up max_tokens: let the other provider answer
         raise RuntimeError("empty answer")
@@ -362,7 +364,7 @@ def _ask(host: str, path: str, key: str, extra: dict, msgs: list, words: int) ->
 
 
 def _race(msgs: list, words: int, racers: tuple) -> str:
-    jobs = {_racers.submit(contextvars.copy_context().run, _ask, host, path, key, extra, msgs, words): name
+    jobs = {_racers.submit(contextvars.copy_context().run, _ask, name, host, path, key, extra, msgs, words): name
             for name, host, path, key, extra in racers}
     pending, errors = set(jobs), []
     while pending:
@@ -412,7 +414,7 @@ class Handler(BaseHTTPRequestHandler):
         notice = accounts.over_limit(user)
         if notice:
             return self.reply(429, {"error": "daily limit reached", "notice": notice})
-        _bill.set(lambda micro: accounts.add_cost(user, micro))
+        _bill.set(lambda part, micro: accounts.add_cost(user, part, micro))
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
         stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
@@ -550,7 +552,7 @@ async def stream_handler(ws, path=None):
                 if notice:  # checked before any provider is paid; the app shows the notice
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "daily limit reached", "notice": notice}))
                     return
-                _bill.set(lambda micro: accounts.add_cost(user, micro))  # the threads below inherit it
+                _bill.set(lambda part, micro: accounts.add_cost(user, part, micro))  # the threads below inherit it
                 meta = {"user": user, "language": language, "script": "roman" if roman else "devanagari", "stt": stt_route,
                         "cleanup": cleaner}
                 try:

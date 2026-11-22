@@ -20,7 +20,8 @@ _lock = threading.Lock()
 _keys = {}     # sha256(key) -> user id
 _caps = {}     # user id -> (daily dictations, daily audio seconds)
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
-_pending = {}  # (user id, day) -> [dictations, seconds, cost µ$] counted here and not yet written
+PARTS = ("stt", "cerebras", "groq", "other")  # cost parts, each its own usage_daily column: <part>_micro
+_pending = {}  # (user id, day) -> [dictations, seconds, µ$ per part in PARTS order...] counted here and not yet written
 LOADED = threading.Event()
 
 
@@ -64,14 +65,16 @@ def refresh() -> None:
 
 def flush() -> None:
     with _lock:
-        batch = dict(_pending)
-    for (user, day), (n, secs, cost) in batch.items():
-        row = _rest("POST", "rpc/add_usage", {"p_user": user, "p_day": day, "p_dictations": n, "p_seconds": secs,
-                                              "p_cost_micro": cost})[0]
+        batch = {k: list(v) for k, v in _pending.items()}  # copies: more may be counted while this is in flight
+    for (user, day), counts in batch.items():
+        row = _rest("POST", "rpc/add_usage", {"p_user": user, "p_day": day, "p_dictations": counts[0],
+                                              "p_seconds": counts[1],
+                                              **{f"p_{part}_micro": c for part, c in zip(PARTS, counts[2:])}})[0]
         with _lock:
             left = _pending[(user, day)]
-            left[0] -= n; left[1] -= secs; left[2] -= cost  # more may have been counted while this was in flight
-            if left[0] <= 0 and left[1] <= 0 and left[2] <= 0:
+            for i, c in enumerate(counts):
+                left[i] -= c
+            if all(v <= 0 for v in left):
                 del _pending[(user, day)]
             if day == today():
                 _used[user] = [row["dictations"], float(row["audio_seconds"])]
@@ -129,24 +132,26 @@ def over_limit(user: str):
     return None
 
 
-def _count(user: str, n: int, seconds: float, cost: int) -> None:
+def _count(user: str, n: int, seconds: float, part: str = "", micro: int = 0) -> None:
     if not ENABLED:
         return
     with _lock:
         if user not in _caps:  # the owner token and keys.json users are not Supabase accounts: nothing to write
             return
-        p = _pending.setdefault((user, today()), [0, 0.0, 0])
-        p[0] += n; p[1] += round(seconds, 1); p[2] += cost
+        p = _pending.setdefault((user, today()), [0, 0.0] + [0] * len(PARTS))
+        p[0] += n; p[1] += round(seconds, 1)
+        if part:
+            p[2 + PARTS.index(part if part in PARTS else "other")] += micro
 
 
 def record(user: str, seconds: float) -> None:
     """One finished dictation of this length."""
-    _count(user, 1, seconds, 0)
+    _count(user, 1, seconds)
 
 
-def add_cost(user: str, micro: int) -> None:
-    """Provider cost in microdollars, whenever it is known (a race's loser reports after the dictation is done)."""
-    _count(user, 0, 0.0, micro)
+def add_cost(user: str, part: str, micro: int) -> None:
+    """One part's provider cost in microdollars, whenever it is known (a race's loser reports after the dictation)."""
+    _count(user, 0, 0.0, part, micro)
 
 
 def audio_seconds(data: bytes, fmt: str) -> float:
@@ -168,8 +173,9 @@ if __name__ == "__main__":  # self-check, no network
     assert over_limit("u") is None
     record("u", 5)
     assert over_limit("u") and over_limit("nobody") is None
-    add_cost("u", 39); record("owner", 5); add_cost("owner", 1)
-    assert _pending == {("u", today()): [1, 5.0, 39]}  # non-Supabase users are never queued for a write
+    add_cost("u", "stt", 321); add_cost("u", "groq", 39); add_cost("u", "cerebras", 40); add_cost("u", "x", 2)
+    record("owner", 5); add_cost("owner", "stt", 1)
+    assert _pending == {("u", today()): [1, 5.0, 321, 40, 39, 2]}  # non-Supabase users are never queued for a write
     _keys[hashlib.sha256(b"utr_x").hexdigest()] = "u"
     assert user_for("utr_x") == "u" and user_for("utr_y") is None
     print("ok")

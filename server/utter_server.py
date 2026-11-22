@@ -414,6 +414,40 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     return (reply["choices"][0]["message"]["content"] or "").strip()
 
 
+NOTES_MODEL = os.environ.get("NOTES_MODEL", "openai/gpt-oss-120b")
+NOTES_PROMPT = """You write meeting notes from a transcript. Lines look like "[12:00] You: ..." (the person who recorded
+the meeting) or "[12:00] Others: ..." (everyone else on the call, mixed together); the time is the minute it was said.
+The transcript is raw speech-to-text: expect fillers, false starts and misheard words, and read past them.
+Write Markdown with these sections, leaving out any that would be empty:
+## Summary — 2 to 5 sentences: what the meeting was about and how it ended.
+## Key points — the substance, as short bullets, in the order it came up.
+## Decisions — what was agreed.
+## Action items — "- [ ] who: what (by when)", using You, Others or a name if one was said.
+## Open questions — what was raised and not settled.
+Use only what is in the transcript: never invent names, numbers, dates or decisions. Write numbers as digits. Keep the
+language the meeting was held in; Hindi or Hinglish stays in Roman letters. Reply with only the notes."""
+
+
+def meeting_notes(transcript: str, language: str) -> str:
+    """A meeting's transcript -> Markdown notes, on OpenRouter (Cerebras first, others as fallback)."""
+    if not transcript.strip():
+        return "_Nothing was said that could be transcribed._"
+    body = json.dumps({"model": NOTES_MODEL, "temperature": 0.2, "max_tokens": 6000, "reasoning": {"effort": "medium"},
+                       "provider": {"order": ["cerebras"]},
+                       "messages": [{"role": "system", "content": NOTES_PROMPT},
+                                    {"role": "user", "content": transcript}]}).encode()
+    t0 = time.monotonic()
+    status, data = call("openrouter.ai", "POST", "/api/v1/chat/completions", body,
+                        {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}, 180)
+    if status != 200:
+        log_call("meeting_notes", NOTES_MODEL, "openrouter", t0, status, error=data[:300].decode(errors="replace"))
+        raise RuntimeError(f"notes HTTP {status}: {data[:200]!r}")
+    reply = json.loads(data)
+    cost = charge((reply.get("usage") or {}).get("cost"), "other")
+    log_call("meeting_notes", NOTES_MODEL, "openrouter", t0, status, reply, cost_micro=cost)
+    return (reply["choices"][0]["message"]["content"] or "").strip()
+
+
 _racers = ThreadPoolExecutor(max_workers=8)  # the loser keeps running to its timeout, then hands its socket back
 
 
@@ -637,6 +671,29 @@ async def stream_handler(ws, path=None):
     language = q.get("language", ["en"])[0]
     roman = q.get("script", [""])[0] == "roman"
     stt_route, stt_model, cleaner, stt_provider = routes_for(user, q)
+    # mode=meeting: one minute of a meeting track -> its plain transcript (no cleanup). mode=notes: a meeting's
+    # transcript -> notes. Both only on plans with meeting notes (Pro), and for the owner token.
+    mode = q.get("mode", ["dictate"])[0]
+    if mode in ("meeting", "notes"):
+        notice = accounts.blocked(user) or (None if accounts.meetings_allowed(user) else
+                                            "Meeting notes are part of the Pro plan.")
+        if notice:
+            await ws.send(json.dumps({"text": "", "error": "not allowed", "notice": notice}))
+            return
+    if mode == "notes":
+        try:
+            transcript = json.loads(await ws.recv()).get("transcript", "")
+            start_dictation(user)
+            _bill.set(lambda part, micro: accounts.add_cost(user, "other", micro))  # meeting costs: usage other_micro
+            t = time.monotonic()
+            notes = await asyncio.to_thread(meeting_notes, transcript, language)
+            await ws.send(json.dumps({"notes": notes}))
+            print(time.strftime("%H:%M:%S"), f"meeting notes: {len(transcript)} chars of transcript -> {len(notes)} "
+                  f"chars of notes in {(time.monotonic() - t) * 1000:.0f} ms", flush=True)
+        except Exception as exc:
+            print(time.strftime("%H:%M:%S"), "meeting notes failed:", str(exc)[:200], flush=True)
+            await ws.send(json.dumps({"error": "notes failed"}))
+        return
     audio = bytearray()
     try:
         async for msg in ws:
@@ -660,6 +717,22 @@ async def stream_handler(ws, path=None):
                     return
                 did = start_dictation(user)  # the threads below inherit its bill and call-log tag
                 script = "roman" if roman else "devanagari"
+                if mode == "meeting":  # transcript only; meeting audio is never saved to disk
+                    _bill.set(lambda part, micro: accounts.add_cost(user, "other", micro))
+                    t = time.monotonic()
+                    try:
+                        raw = await asyncio.to_thread(transcribe, bytes(audio), language, stt_route, "ogg", stt_model,
+                                                      stt_provider)
+                    except Exception as exc:
+                        log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, "meeting", error=str(exc))
+                        await ws.send(json.dumps({"error": "transcription failed"}))
+                        return
+                    accounts.record_audio(user, accounts.audio_seconds(bytes(audio), "ogg"))
+                    result = {"text": raw, "raw": raw, "stt_ms": round((time.monotonic() - t) * 1000), "cleanup_ms": 0,
+                              "total_ms": round((time.monotonic() - t) * 1000)}
+                    log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, "meeting", result)
+                    await ws.send(json.dumps(result))
+                    return
                 meta = {"user": user, "language": language, "script": script, "stt": stt_route, "cleanup": cleaner}
                 try:
                     result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman, stt_model, stt_provider)

@@ -644,6 +644,15 @@ def make_tray(window: Window) -> QSystemTrayIcon:
             action = QAction(label, menu)
             action.triggered.connect(handler)
             menu.addAction(action)
+    if sys.platform.startswith("linux"):  # meeting notes: Linux first (system audio is PipeWire's monitor source)
+        from .meeting import MEETING
+        meeting = QAction("Start meeting notes", menu)
+
+        def on_meeting() -> None:
+            meeting.setText("Stop meeting notes" if MEETING.toggle() else "Start meeting notes")
+
+        meeting.triggered.connect(on_meeting)
+        menu.insertAction(menu.actions()[3], meeting)  # above Settings' separator, with the other actions
     tray.setContextMenu(menu)
     if sys.platform == "win32":  # a left click on Windows opens the window; the menu is on the right click
         tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger and window.open("history"))

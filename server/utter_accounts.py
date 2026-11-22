@@ -21,6 +21,7 @@ _keys = {}     # sha256(key) -> user id
 _caps = {}     # user id -> (daily dictations, daily audio seconds)
 _routes = {}   # user id -> (stt model, cleanup route) from their plan
 _blocked = {}  # user id -> reason, for profiles.disabled
+_meetings = set()  # user ids whose plan includes meeting notes (plans.meetings)
 _seen = set()  # sha256 of keys used since the last flush, for api_keys.last_used_at
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
 _models = []   # [(model, provider)] for cleanup slots 1, 2, from public.cleanup_models; empty = the server's defaults
@@ -59,11 +60,12 @@ def refresh() -> None:
     day = today()
     keys = {r["key_hash"]: r["user_id"] for r in _all("api_keys?select=key_hash,user_id&revoked_at=is.null")}
     profiles = _all("profiles?select=user_id,disabled,disabled_reason,"
-                    "plans(daily_dictations,daily_audio_seconds,stt_model,stt_provider,cleanup)")
+                    "plans(daily_dictations,daily_audio_seconds,stt_model,stt_provider,cleanup,meetings)")
     caps = {r["user_id"]: (r["plans"]["daily_dictations"], r["plans"]["daily_audio_seconds"]) for r in profiles}
     routes = {r["user_id"]: (r["plans"]["stt_model"], r["plans"]["cleanup"], r["plans"]["stt_provider"] or "")
               for r in profiles}
     blocked = {r["user_id"]: r["disabled_reason"] or "" for r in profiles if r["disabled"]}
+    meetings = {r["user_id"] for r in profiles if r["plans"].get("meetings")}
     used = {r["user_id"]: [r["dictations"], float(r["audio_seconds"])]
             for r in _all(f"usage_daily?select=user_id,dictations,audio_seconds&day=eq.{day}")}
     models = [(r["model"], r["provider"]) for r in _all("cleanup_models?select=model,provider&order=slot")]
@@ -75,6 +77,7 @@ def refresh() -> None:
         _caps.clear(); _caps.update(caps)
         _routes.clear(); _routes.update(routes)
         _blocked.clear(); _blocked.update(blocked)
+        _meetings.clear(); _meetings.update(meetings)
         _used.clear(); _used.update(used)
         _models[:] = models
     LOADED.set()
@@ -238,6 +241,17 @@ def record(user: str, seconds: float) -> None:
     _count(user, 1, seconds)
 
 
+def record_audio(user: str, seconds: float) -> None:
+    """Audio that is not a dictation (a meeting minute): counts toward the daily audio cap, not the dictation count."""
+    _count(user, 0, seconds)
+
+
+def meetings_allowed(user: str) -> bool:
+    """Meeting notes: on plans with plans.meetings, and for the owner token and keys.json users (no plan)."""
+    with _lock:
+        return user not in _caps or user in _meetings
+
+
 def add_cost(user: str, part: str, micro: int) -> None:
     """One part's provider cost in microdollars, whenever it is known (a race's loser reports after the dictation)."""
     _count(user, 0, 0.0, part, micro)
@@ -275,4 +289,8 @@ if __name__ == "__main__":  # self-check, no network
     _routes["u"], _blocked["u"] = ("openai/whisper-large-v3-turbo", "orrace", "groq"), "spam"
     assert route_for("u")[0].startswith("openai/") and route_for("owner") is None
     assert blocked("u") == "This account is disabled: spam." and blocked("owner") is None
+    assert not meetings_allowed("u") and meetings_allowed("owner")
+    _meetings.add("u"); assert meetings_allowed("u")
+    before = list(_pending[("u", today())]); record_audio("u", 60)
+    assert _pending[("u", today())][0] == before[0] and _pending[("u", today())][1] == before[1] + 60
     print("ok")

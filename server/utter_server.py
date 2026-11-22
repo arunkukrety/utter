@@ -245,8 +245,10 @@ def to_mp3(audio: bytes) -> bytes:
 STT_MODELS = {"openrouter": OPENROUTER_STT_MODEL, "cartesia": CARTESIA_STT_MODEL}  # others are set further down
 
 
-def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3") -> str:
+def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3", stt_model: str = "") -> str:
+    """stt_model picks the OpenRouter model (a plan's choice); empty means OPENROUTER_STT_MODEL."""
     t0 = time.monotonic()
+    or_model = stt_model or OPENROUTER_STT_MODEL
     if route == "surplus" and fmt != "mp3":
         mp3, fmt = to_mp3(mp3), "mp3"
     filename, ctype = ("dictation.ogg", "audio/ogg") if fmt == "ogg" else ("dictation.mp3", "audio/mpeg")
@@ -288,7 +290,7 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
             return transcribe(mp3, language, "groq", fmt)
     elif route == "openrouter":
         o = "utter" + secrets.token_hex(8)
-        ofields = {"model": OPENROUTER_STT_MODEL, **({"language": "en"} if language != "multi" else {})}
+        ofields = {"model": or_model, **({"language": "en"} if language != "multi" else {})}
         obody = b"".join(f"--{o}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
                          for k, v in ofields.items())
         obody += (f"--{o}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
@@ -300,7 +302,7 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
             status, data = 0, str(exc).encode()
         if status != 200:  # OpenRouter or AssemblyAI is down: the dictation still gets Groq Whisper
             print(time.strftime("%H:%M:%S"), f"openrouter stt failed ({status} {data[:120]!r}); using groq", flush=True)
-            log_call("stt", OPENROUTER_STT_MODEL, "openrouter", t0, status, error=data[:300].decode(errors="replace"))
+            log_call("stt", or_model, "openrouter", t0, status, error=data[:300].decode(errors="replace"))
             return transcribe(mp3, language, "groq", fmt)
     elif route == "surplus":  # the same Scribe v2, through the Surplus key market
         status, data = call("api.surplusintelligence.ai", "POST", "/v1/resources/elevenlabs/v1/speech-to-text", body,
@@ -308,7 +310,7 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
     else:
         status, data = call("api.elevenlabs.io", "POST", "/v1/speech-to-text", body,
                             {"xi-api-key": ELEVENLABS_KEY, "Content-Type": f"multipart/form-data; boundary={b}"})
-    model = STT_MODELS.get(route) or (GROQ_STT_MODEL if route == "groq" else SCRIBE_MODEL)
+    model = or_model if route == "openrouter" else STT_MODELS.get(route) or (GROQ_STT_MODEL if route == "groq" else SCRIBE_MODEL)
     if status != 200:
         log_call("stt", model, route, t0, status, error=data[:300].decode(errors="replace"))
         raise RuntimeError(f"transcription ({route}) HTTP {status}: {data[:200]!r}")
@@ -316,9 +318,23 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
     cost = 0
     if route == "openrouter":
         usage = reply.get("usage") or {}
-        cost = charge(usage.get("cost") or (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600, "stt")
+        usd = usage.get("cost")
+        if not usd and or_model.startswith("assemblyai/"):  # our BYOK key: AssemblyAI bills us, OpenRouter says 0
+            usd = (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600
+        cost = charge(usd, "stt")
     log_call("stt", model, route, t0, status, reply, cost_micro=cost)
     return reply.get("text", "").strip()
+
+
+def routes_for(user: str, q: dict) -> tuple:
+    """(stt route, stt model, cleanup route). A user on a plan gets the plan's routes and nothing the request asks for,
+    so a free key can never pick a pricier route; the owner token and keys.json users may still choose with ?stt= and
+    ?cleanup=."""
+    plan = accounts.route_for(user)
+    if plan:
+        return "openrouter", plan[0], plan[1]
+    return (pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia")), "",
+            pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace")))
 
 
 def clean(text: str, provider: str = "groq", roman: bool = False) -> str:
@@ -489,17 +505,19 @@ class Handler(BaseHTTPRequestHandler):
         user = key_owner(self.headers.get("Authorization", ""))
         if not user:
             return self.reply(401, {"error": "bad token"})
+        notice = accounts.blocked(user)
+        if notice:
+            return self.reply(403, {"error": "account disabled", "notice": notice})
         notice = accounts.over_limit(user)
         if notice:
             return self.reply(429, {"error": "daily limit reached", "notice": notice})
         did = start_dictation(user)
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
-        stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
-        cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace"))       # ?cleanup=groq|surplus
+        stt_route, stt_model, cleaner = routes_for(user, q)
         t0 = time.monotonic()
         try:
-            raw = transcribe(mp3, language, stt_route)
+            raw = transcribe(mp3, language, stt_route, "mp3", stt_model)
             t1 = time.monotonic()
             text = clean(raw, cleaner) if raw else ""
             t2 = time.monotonic()
@@ -566,10 +584,11 @@ def same_words(a: str, b: str) -> bool:
     return norm(a) == norm(b)
 
 
-async def finish_stream(ws, audio: bytes, language: str, stt_route: str, cleaner: str, roman: bool = False) -> dict:
+async def finish_stream(ws, audio: bytes, language: str, stt_route: str, cleaner: str, roman: bool = False,
+                        stt_model: str = "") -> dict:
     """Scribe on the audio; meanwhile take the app's live transcript (if it sends one) and clean that early."""
     t0 = time.monotonic()
-    stt = asyncio.ensure_future(asyncio.to_thread(transcribe, audio, language, stt_route, "ogg"))
+    stt = asyncio.ensure_future(asyncio.to_thread(transcribe, audio, language, stt_route, "ogg", stt_model))
     early, live_text = None, ""
     while not stt.done():
         recv = asyncio.ensure_future(ws.recv())
@@ -614,8 +633,7 @@ async def stream_handler(ws, path=None):
     q = urllib.parse.parse_qs(urllib.parse.urlparse(req_path).query)
     language = q.get("language", ["en"])[0]
     roman = q.get("script", [""])[0] == "roman"
-    stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))
-    cleaner = pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace"))
+    stt_route, stt_model, cleaner = routes_for(user, q)
     audio = bytearray()
     try:
         async for msg in ws:
@@ -629,15 +647,19 @@ async def stream_handler(ws, path=None):
                 if not audio:
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "no audio"}))
                     return
-                notice = accounts.over_limit(user)
+                notice = accounts.blocked(user)
                 if notice:  # checked before any provider is paid; the app shows the notice
+                    await ws.send(json.dumps({"text": "", "raw": "", "error": "account disabled", "notice": notice}))
+                    return
+                notice = accounts.over_limit(user)
+                if notice:
                     await ws.send(json.dumps({"text": "", "raw": "", "error": "daily limit reached", "notice": notice}))
                     return
                 did = start_dictation(user)  # the threads below inherit its bill and call-log tag
                 script = "roman" if roman else "devanagari"
                 meta = {"user": user, "language": language, "script": script, "stt": stt_route, "cleanup": cleaner}
                 try:
-                    result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman)
+                    result = await finish_stream(ws, bytes(audio), language, stt_route, cleaner, roman, stt_model)
                 except Exception as exc:
                     print(time.strftime("%H:%M:%S"), "stream failed:", str(exc)[:200], flush=True)
                     await ws.send(json.dumps({"error": "transcription failed"}))  # details stay in the log

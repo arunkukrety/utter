@@ -19,6 +19,9 @@ PAGE = 1000  # PostgREST returns at most this many rows per request
 _lock = threading.Lock()
 _keys = {}     # sha256(key) -> user id
 _caps = {}     # user id -> (daily dictations, daily audio seconds)
+_routes = {}   # user id -> (stt model, cleanup route) from their plan
+_blocked = {}  # user id -> reason, for profiles.disabled
+_seen = set()  # sha256 of keys used since the last flush, for api_keys.last_used_at
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
 _models = []   # [(model, provider)] for cleanup slots 1, 2, from public.cleanup_models; empty = the server's defaults
 _logs = {"dictations": [], "provider_calls": []}  # analysis rows waiting to be written, oldest first
@@ -55,8 +58,11 @@ def _all(path: str) -> list:
 def refresh() -> None:
     day = today()
     keys = {r["key_hash"]: r["user_id"] for r in _all("api_keys?select=key_hash,user_id&revoked_at=is.null")}
-    caps = {r["user_id"]: (r["plans"]["daily_dictations"], r["plans"]["daily_audio_seconds"])
-            for r in _all("profiles?select=user_id,plans(daily_dictations,daily_audio_seconds)")}
+    profiles = _all("profiles?select=user_id,disabled,disabled_reason,"
+                    "plans(daily_dictations,daily_audio_seconds,stt_model,cleanup)")
+    caps = {r["user_id"]: (r["plans"]["daily_dictations"], r["plans"]["daily_audio_seconds"]) for r in profiles}
+    routes = {r["user_id"]: (r["plans"]["stt_model"], r["plans"]["cleanup"]) for r in profiles}
+    blocked = {r["user_id"]: r["disabled_reason"] or "" for r in profiles if r["disabled"]}
     used = {r["user_id"]: [r["dictations"], float(r["audio_seconds"])]
             for r in _all(f"usage_daily?select=user_id,dictations,audio_seconds&day=eq.{day}")}
     models = [(r["model"], r["provider"]) for r in _all("cleanup_models?select=model,provider&order=slot")]
@@ -66,12 +72,23 @@ def refresh() -> None:
     with _lock:
         _keys.clear(); _keys.update(keys)
         _caps.clear(); _caps.update(caps)
+        _routes.clear(); _routes.update(routes)
+        _blocked.clear(); _blocked.update(blocked)
         _used.clear(); _used.update(used)
         _models[:] = models
     LOADED.set()
 
 
 def flush() -> None:
+    with _lock:
+        seen = list(_seen); _seen.clear()
+    if seen:  # one request for every key used since the last flush
+        try:
+            _rest("PATCH", f"api_keys?key_hash=in.({','.join(seen)})", {"last_used_at": now_iso()})
+        except Exception:
+            with _lock:
+                _seen.update(seen)
+            raise
     with _lock:
         batch = {k: list(v) for k, v in _pending.items()}  # copies: more may be counted while this is in flight
     for (user, day), counts in batch.items():
@@ -159,9 +176,27 @@ def cleanup_models() -> list:
 
 
 def user_for(key: str):
-    """The Supabase user id behind a key, or None."""
+    """The Supabase user id behind a key, or None. Notes the key as used, for last_used_at."""
+    h = hashlib.sha256(key.encode()).hexdigest()
     with _lock:
-        return _keys.get(hashlib.sha256(key.encode()).hexdigest())
+        user = _keys.get(h)
+        if user:
+            _seen.add(h)
+        return user
+
+
+def route_for(user: str):
+    """(stt model, cleanup route) from the user's plan, or None for users without one (the owner, keys.json)."""
+    with _lock:
+        return _routes.get(user)
+
+
+def blocked(user: str):
+    """A sentence to show a disabled user, or None."""
+    with _lock:
+        if user not in _blocked:
+            return None
+        return "This account is disabled" + (f": {_blocked[user]}" if _blocked[user] else "") + "."
 
 
 def _today(user: str) -> tuple:
@@ -234,4 +269,8 @@ if __name__ == "__main__":  # self-check, no network
                                    {"id": "b", "user_id": None, "user_label": "owner"}]  # the owner IS logged, by label
     _keys[hashlib.sha256(b"utr_x").hexdigest()] = "u"
     assert user_for("utr_x") == "u" and user_for("utr_y") is None
+    assert _seen == {hashlib.sha256(b"utr_x").hexdigest()}  # only a known key is stamped
+    _routes["u"], _blocked["u"] = ("openai/whisper-large-v3-turbo", "orrace"), "spam"
+    assert route_for("u")[0].startswith("openai/") and route_for("owner") is None
+    assert blocked("u") == "This account is disabled: spam." and blocked("owner") is None
     print("ok")

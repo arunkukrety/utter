@@ -41,8 +41,8 @@ OPENROUTER_STT_USD_PER_HOUR = float(os.environ.get("OPENROUTER_STT_USD_PER_HOUR"
 
 # What the current dictation's provider calls cost: a callable taking (part, microdollars), set per dictation. Threads
 # started for it (asyncio.to_thread, the race) carry it along, so a race's loser that finishes later is still charged.
-# Parts (accounts.PARTS): "stt" (AssemblyAI), "cerebras" and "groq" (the two sides of a cleanup race), "other" (any
-# other paid cleanup call).
+# Parts (accounts.PARTS): "stt" (AssemblyAI), "cleanup_model1" and "cleanup_model2" (the first and second racer of a
+# cleanup race, whatever model or provider each is), "other" (any other paid cleanup call).
 _bill = contextvars.ContextVar("bill", default=None)
 
 
@@ -349,14 +349,14 @@ OPENROUTER_RACERS = tuple((p, "openrouter.ai", "/api/v1/chat/completions", OPENR
                             "provider": {"only": [p], "allow_fallbacks": False}}) for p in ("cerebras", "groq"))
 
 
-def _ask(name: str, host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:
+def _ask(part: str, host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:
     body = json.dumps({"temperature": 0, "max_tokens": 2 * words + 512, "messages": msgs, **extra}).encode()
     status, data = call(host, "POST", path, body, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                         CLEANUP_TIMEOUT_S)
     if status != 200:
         raise RuntimeError(f"HTTP {status}: {data[:120]!r}")
     reply = json.loads(data)
-    charge((reply.get("usage") or {}).get("cost"), name)  # both sides of a race are billed, the loser too
+    charge((reply.get("usage") or {}).get("cost"), part)  # both sides of a race are billed, the loser too
     out = (reply["choices"][0]["message"]["content"] or "").strip()
     if not out:  # reasoning used up max_tokens: let the other provider answer
         raise RuntimeError("empty answer")
@@ -364,8 +364,9 @@ def _ask(name: str, host: str, path: str, key: str, extra: dict, msgs: list, wor
 
 
 def _race(msgs: list, words: int, racers: tuple) -> str:
-    jobs = {_racers.submit(contextvars.copy_context().run, _ask, name, host, path, key, extra, msgs, words): name
-            for name, host, path, key, extra in racers}
+    jobs = {_racers.submit(contextvars.copy_context().run, _ask, f"cleanup_model{i}", host, path, key, extra, msgs,
+                           words): name
+            for i, (name, host, path, key, extra) in enumerate(racers, 1)}  # billed by slot, so a model swap keeps columns
     pending, errors = set(jobs), []
     while pending:
         done, pending = wait(pending, return_when=FIRST_COMPLETED)

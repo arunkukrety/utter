@@ -20,7 +20,7 @@ _lock = threading.Lock()
 _keys = {}     # sha256(key) -> user id
 _caps = {}     # user id -> (daily dictations, daily audio seconds)
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
-PARTS = ("stt", "cerebras", "groq", "other")  # cost parts, each its own usage_daily column: <part>_micro
+PARTS = ("stt", "cleanup_model1", "cleanup_model2", "other")  # cost parts, each its own usage_daily column: <part>_micro
 _pending = {}  # (user id, day) -> [dictations, seconds, µ$ per part in PARTS order...] counted here and not yet written
 LOADED = threading.Event()
 
@@ -173,7 +173,8 @@ if __name__ == "__main__":  # self-check, no network
     assert over_limit("u") is None
     record("u", 5)
     assert over_limit("u") and over_limit("nobody") is None
-    add_cost("u", "stt", 321); add_cost("u", "groq", 39); add_cost("u", "cerebras", 40); add_cost("u", "x", 2)
+    add_cost("u", "stt", 321); add_cost("u", "cleanup_model2", 39); add_cost("u", "cleanup_model1", 40)
+    add_cost("u", "x", 2)
     record("owner", 5); add_cost("owner", "stt", 1)
     assert _pending == {("u", today()): [1, 5.0, 321, 40, 39, 2]}  # non-Supabase users are never queued for a write
     _keys[hashlib.sha256(b"utr_x").hexdigest()] = "u"

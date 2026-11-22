@@ -378,16 +378,18 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path != "/dictate":
             return self.reply(404, {"error": "not found"})
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 < length <= MAX_AUDIO:
+            return self.reply(413 if length else 400, {"error": "send the recording as an MP3 body"})
+        # Read the body before any refusal: replying while the proxy is still uploading breaks its pipe, and Caddy then
+        # hands the client a 502 instead of our 401/429.
+        mp3 = self.rfile.read(length)
         user = key_owner(self.headers.get("Authorization", ""))
         if not user:
             return self.reply(401, {"error": "bad token"})
         notice = accounts.over_limit(user)
         if notice:
             return self.reply(429, {"error": "daily limit reached", "notice": notice})
-        length = int(self.headers.get("Content-Length") or 0)
-        if not 0 < length <= MAX_AUDIO:
-            return self.reply(413 if length else 400, {"error": "send the recording as an MP3 body"})
-        mp3 = self.rfile.read(length)
         q = parse_qs(url.query)
         language = q.get("language", ["en"])[0]
         stt_route = pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia"))

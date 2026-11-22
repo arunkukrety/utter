@@ -292,7 +292,7 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
         return _race(msgs, len(text.split()), DIRECT_RACERS)
     if provider == "orrace":
         try:
-            return _race(msgs, len(text.split()), OPENROUTER_RACERS)
+            return _race(msgs, len(text.split()), openrouter_racers())
         except Exception as exc:
             print(time.strftime("%H:%M:%S"), f"orrace cleanup failed ({str(exc)[:160]}); using cerebras", flush=True)
             return _clean(text, "cerebras", roman)
@@ -344,9 +344,16 @@ DIRECT_RACERS = (("cerebras", "api.cerebras.ai", "/v1/chat/completions", CEREBRA
                   {"model": RACE_CEREBRAS_MODEL, "reasoning_effort": "low"}),
                  ("groq", "api.groq.com", "/openai/v1/chat/completions", GROQ_KEY,
                   {"model": RACE_GROQ_MODEL, "reasoning_effort": "low"}))
-OPENROUTER_RACERS = tuple((p, "openrouter.ai", "/api/v1/chat/completions", OPENROUTER_KEY,
-                           {"model": "openai/gpt-oss-120b", "reasoning": {"effort": "low"},
-                            "provider": {"only": [p], "allow_fallbacks": False}}) for p in ("cerebras", "groq"))
+# The OpenRouter race's two racers come from Supabase's cleanup_models table (slot 1, slot 2), read in the background
+# with the keys and kept in memory: choosing them costs a dictation nothing. These are used until it loads, or without it.
+DEFAULT_CLEANUP_MODELS = [("openai/gpt-oss-120b", "cerebras"), ("openai/gpt-oss-120b", "groq")]
+
+
+def openrouter_racers() -> tuple:
+    return tuple((provider, "openrouter.ai", "/api/v1/chat/completions", OPENROUTER_KEY,
+                  {"model": model, "reasoning": {"effort": "low"},
+                   "provider": {"only": [provider], "allow_fallbacks": False}})
+                 for model, provider in (accounts.cleanup_models() or DEFAULT_CLEANUP_MODELS))
 
 
 def _ask(part: str, host: str, path: str, key: str, extra: dict, msgs: list, words: int) -> str:

@@ -20,6 +20,7 @@ _lock = threading.Lock()
 _keys = {}     # sha256(key) -> user id
 _caps = {}     # user id -> (daily dictations, daily audio seconds)
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
+_models = []   # [(model, provider)] for cleanup slots 1, 2, from public.cleanup_models; empty = the server's defaults
 PARTS = ("stt", "cleanup_model1", "cleanup_model2", "other")  # cost parts, each its own usage_daily column: <part>_micro
 _pending = {}  # (user id, day) -> [dictations, seconds, µ$ per part in PARTS order...] counted here and not yet written
 LOADED = threading.Event()
@@ -56,10 +57,15 @@ def refresh() -> None:
             for r in _all("profiles?select=user_id,plans(daily_dictations,daily_audio_seconds)")}
     used = {r["user_id"]: [r["dictations"], float(r["audio_seconds"])]
             for r in _all(f"usage_daily?select=user_id,dictations,audio_seconds&day=eq.{day}")}
+    models = [(r["model"], r["provider"]) for r in _all("cleanup_models?select=model,provider&order=slot")]
+    if models != _models:  # at start, and whenever someone edits the table
+        print(time.strftime("%H:%M:%S"), "cleanup models:", ", ".join(f"{i}={m} on {p}" for i, (m, p) in
+                                                                      enumerate(models, 1)) or "server defaults", flush=True)
     with _lock:
         _keys.clear(); _keys.update(keys)
         _caps.clear(); _caps.update(caps)
         _used.clear(); _used.update(used)
+        _models[:] = models
     LOADED.set()
 
 
@@ -104,6 +110,12 @@ def start() -> None:
 
 def ready() -> bool:
     return not ENABLED or LOADED.is_set()
+
+
+def cleanup_models() -> list:
+    """[(model, provider)] for cleanup slots 1 and 2 from the last refresh, or [] to use the server's defaults."""
+    with _lock:
+        return list(_models)
 
 
 def user_for(key: str):

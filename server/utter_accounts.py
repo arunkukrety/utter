@@ -124,6 +124,22 @@ def log(table: str, user: str, row: dict) -> None:
         del rows[:-LOG_CAP]
 
 
+def save_meeting(user: str, row: dict):
+    """Store a meeting's transcript and notes (public.meetings) and return its id, or None when accounts are off.
+    One write, at once: it is the user's content, not analysis, so it is never batched or dropped on a full queue."""
+    if not ENABLED:
+        return None
+    with _lock:
+        supa = user in _caps
+    body = {**row, "user_id": user if supa else None, "user_label": None if supa else user}
+    req = urllib.request.Request(f"{URL}/rest/v1/meetings", method="POST", data=json.dumps(body).encode(),
+                                 headers={"apikey": SECRET, "Content-Type": "application/json",
+                                          "Prefer": "return=representation",
+                                          **({"Authorization": "Bearer " + SECRET} if SECRET.startswith("eyJ") else {})})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())[0]["id"]
+
+
 def flush_logs() -> None:
     for table in _logs:
         with _lock:

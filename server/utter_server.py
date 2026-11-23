@@ -487,10 +487,11 @@ def meeting_segments(ogg: bytes, language: str, diarize: bool, stt_route: str, s
         return [{"speaker": None, "start": 0.0, "end": accounts.audio_seconds(ogg, "ogg"), "text": text}] if text else []
 
 
-def meeting_notes(transcript: str, language: str) -> str:
-    """A meeting's transcript -> Markdown notes: NOTES_MODEL through Surplus, else NOTES_FALLBACK_MODEL on OpenRouter."""
+def meeting_notes(transcript: str, language: str) -> tuple:
+    """A meeting's transcript -> (Markdown notes, the model that wrote them): NOTES_MODEL through Surplus, else
+    NOTES_FALLBACK_MODEL on OpenRouter."""
     if not transcript.strip():
-        return "_Nothing was said that could be transcribed._"
+        return "_Nothing was said that could be transcribed._", None
     msgs = [{"role": "system", "content": NOTES_PROMPT}, {"role": "user", "content": transcript}]
     t0 = time.monotonic()
     try:
@@ -506,7 +507,7 @@ def meeting_notes(transcript: str, language: str) -> str:
         cost = (reply.get("usage") or {}).get("buyer_cost_micro") or 0  # exactly what Surplus billed
         charge(cost / 1_000_000, "other")
         log_call("meeting_notes", NOTES_MODEL, "surplus", t0, status, reply, cost_micro=cost)
-        return notes
+        return notes, NOTES_MODEL
     except Exception as exc:
         print(time.strftime("%H:%M:%S"), f"notes via surplus failed ({str(exc)[:150]}); using {NOTES_FALLBACK_MODEL}",
               flush=True)
@@ -522,7 +523,7 @@ def meeting_notes(transcript: str, language: str) -> str:
     reply = json.loads(data)
     cost = charge((reply.get("usage") or {}).get("cost"), "other")
     log_call("meeting_notes", NOTES_FALLBACK_MODEL, "openrouter", t0, status, reply, cost_micro=cost)
-    return (reply["choices"][0]["message"]["content"] or "").strip()
+    return (reply["choices"][0]["message"]["content"] or "").strip(), NOTES_FALLBACK_MODEL
 
 
 _racers = ThreadPoolExecutor(max_workers=8)  # the loser keeps running to its timeout, then hands its socket back
@@ -759,14 +760,27 @@ async def stream_handler(ws, path=None):
             return
     if mode == "notes":
         try:
-            transcript = json.loads(await ws.recv()).get("transcript", "")
+            req = json.loads(await ws.recv())
+            transcript = req.get("transcript", "")
             start_dictation(user)
             _bill.set(lambda part, micro: accounts.add_cost(user, "other", micro))  # meeting costs: usage other_micro
             t = time.monotonic()
-            notes = await asyncio.to_thread(meeting_notes, transcript, language)
-            await ws.send(json.dumps({"notes": notes}))
+            notes, model = await asyncio.to_thread(meeting_notes, transcript, language)
+            meeting_id = None
+            if transcript.strip():  # kept for the user (public.meetings); a failed save never costs them their notes
+                try:
+                    started = req.get("started")
+                    meeting_id = await asyncio.to_thread(accounts.save_meeting, user, {
+                        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)) if started else None,
+                        "duration_seconds": req.get("duration_s"),
+                        "speakers": len(set(re.findall(r"\] (Speaker \d+):", transcript))),
+                        "transcript": transcript, "notes": notes, "notes_model": model})
+                except Exception as exc:
+                    print(time.strftime("%H:%M:%S"), "meeting not saved:", str(exc)[:200], flush=True)
+            await ws.send(json.dumps({"notes": notes, "meeting_id": meeting_id}))
             print(time.strftime("%H:%M:%S"), f"meeting notes: {len(transcript)} chars of transcript -> {len(notes)} "
-                  f"chars of notes in {(time.monotonic() - t) * 1000:.0f} ms", flush=True)
+                  f"chars of notes in {(time.monotonic() - t) * 1000:.0f} ms ({model}; saved as {meeting_id})",
+                  flush=True)
         except Exception as exc:
             print(time.strftime("%H:%M:%S"), "meeting notes failed:", str(exc)[:200], flush=True)
             await ws.send(json.dumps({"error": "notes failed"}))

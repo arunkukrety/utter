@@ -142,9 +142,10 @@ async def _finish(folder: str, started: float) -> None:
             minutes = sorted(f for f in files if os.path.basename(f).startswith(track + "-"))
             for i in range(0, len(minutes), PART_MINUTES):
                 jobs.append(one(track, i // PART_MINUTES, minutes[i:i + PART_MINUTES]))
-        lines = []
+        lines, duration = [], 0.0
         for offset, track, segs in await asyncio.gather(*jobs):
             for s in segs:
+                duration = max(duration, offset + s["end"])
                 who = "You" if track == "you" else (s.get("speaker") or "Others")
                 lines.append((offset + s["start"], f"{who}: {s['text']}"))
         lines.sort(key=lambda x: x[0])
@@ -155,7 +156,8 @@ async def _finish(folder: str, started: float) -> None:
             f.write(f"# Meeting transcript — {when}\n\n" + (transcript or "_Nothing was transcribed._") + "\n")
         for attempt in (1, 2):  # a reply that never comes is retried once on a fresh connection
             try:
-                reply = await _ask(url + "&mode=notes", token, json.dumps({"transcript": transcript}), 120)
+                reply = await _ask(url + "&mode=notes", token, json.dumps({"transcript": transcript, "started": started,
+                                                                         "duration_s": round(duration, 1)}), 120)
                 break
             except (asyncio.TimeoutError, OSError, websockets.ConnectionClosed) as exc:
                 core.LOG(f"meeting: notes attempt {attempt} failed ({type(exc).__name__})")

@@ -414,7 +414,11 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     return (reply["choices"][0]["message"]["content"] or "").strip()
 
 
-NOTES_MODEL = os.environ.get("NOTES_MODEL", "openai/gpt-oss-120b")
+# Notes are written by Gemini 4 Argon through Surplus: on a real meeting it wrote as well as Claude Sonnet 5.5 (named the
+# speakers from context, every point covered) at ~1/80th the price (2026-11-24; ~98% off its $2/$10 per 1M list price
+# that day, which depends on the sellers). If Surplus fails, gpt-oss-120b on OpenRouter writes them instead.
+NOTES_MODEL = os.environ.get("NOTES_MODEL", "gemini-4-argon")
+NOTES_FALLBACK_MODEL = os.environ.get("NOTES_FALLBACK_MODEL", "openai/gpt-oss-120b")
 NOTES_PROMPT = """You write meeting notes from a transcript. Lines look like "[12:00:05] You: ..." (the person who
 recorded the meeting) or "[12:00:09] Speaker 2: ..." (someone else on the call; the same number is the same person,
 except that numbering restarts every 25 minutes of the call). A line may say "Others" when the voices could not be
@@ -426,8 +430,9 @@ Write Markdown with these sections, leaving out any that would be empty:
 ## Decisions — what was agreed.
 ## Action items — "- [ ] who: what (by when)", using You, a name, or the speaker's number.
 ## Open questions — what was raised and not settled.
-Use only what is in the transcript: never invent names, numbers, dates or decisions. Write numbers as digits. Keep the
-language the meeting was held in; Hindi or Hinglish stays in Roman letters. Reply with only the notes."""
+Use only what is in the transcript: never invent names, numbers, dates or decisions. Write numbers as digits. Write the
+notes in English, even when the meeting was in Hindi or Hinglish; when you quote someone, keep their own words and write
+any Hindi in Roman letters. Reply with only the notes."""
 
 # Meeting tracks go to ElevenLabs Scribe through the Surplus key market as whole recordings (up to 25 minutes a part):
 # speaker labels on the others' track, real timestamps on both, Hindi and Hinglish handled. $0.04 an hour there (80% off
@@ -481,22 +486,40 @@ def meeting_segments(ogg: bytes, language: str, diarize: bool, stt_route: str, s
 
 
 def meeting_notes(transcript: str, language: str) -> str:
-    """A meeting's transcript -> Markdown notes, on OpenRouter (Cerebras first, others as fallback)."""
+    """A meeting's transcript -> Markdown notes: NOTES_MODEL through Surplus, else NOTES_FALLBACK_MODEL on OpenRouter."""
     if not transcript.strip():
         return "_Nothing was said that could be transcribed._"
-    body = json.dumps({"model": NOTES_MODEL, "temperature": 0.2, "max_tokens": 6000, "reasoning": {"effort": "medium"},
-                       "provider": {"order": ["cerebras"]},
-                       "messages": [{"role": "system", "content": NOTES_PROMPT},
-                                    {"role": "user", "content": transcript}]}).encode()
+    msgs = [{"role": "system", "content": NOTES_PROMPT}, {"role": "user", "content": transcript}]
     t0 = time.monotonic()
+    try:
+        body = json.dumps({"model": NOTES_MODEL, "temperature": 0.2, "max_tokens": 6000, "messages": msgs}).encode()
+        status, data = call("api.surplusintelligence.ai", "POST", "/v1/chat/completions", body,
+                            {"Authorization": f"Bearer {SURPLUS_KEY}", "Content-Type": "application/json"}, 180)
+        if status != 200:
+            raise RuntimeError(f"HTTP {status}: {data[:150]!r}")
+        reply = json.loads(data)
+        notes = (reply["choices"][0]["message"]["content"] or "").strip()
+        if not notes:
+            raise RuntimeError("empty notes")
+        cost = (reply.get("usage") or {}).get("buyer_cost_micro") or 0  # exactly what Surplus billed
+        charge(cost / 1_000_000, "other")
+        log_call("meeting_notes", NOTES_MODEL, "surplus", t0, status, reply, cost_micro=cost)
+        return notes
+    except Exception as exc:
+        print(time.strftime("%H:%M:%S"), f"notes via surplus failed ({str(exc)[:150]}); using {NOTES_FALLBACK_MODEL}",
+              flush=True)
+        log_call("meeting_notes", NOTES_MODEL, "surplus", t0, 0, error=str(exc))
+    t0 = time.monotonic()
+    body = json.dumps({"model": NOTES_FALLBACK_MODEL, "temperature": 0.2, "max_tokens": 6000,
+                       "reasoning": {"effort": "medium"}, "provider": {"order": ["cerebras"]}, "messages": msgs}).encode()
     status, data = call("openrouter.ai", "POST", "/api/v1/chat/completions", body,
                         {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}, 180)
     if status != 200:
-        log_call("meeting_notes", NOTES_MODEL, "openrouter", t0, status, error=data[:300].decode(errors="replace"))
+        log_call("meeting_notes", NOTES_FALLBACK_MODEL, "openrouter", t0, status, error=data[:300].decode(errors="replace"))
         raise RuntimeError(f"notes HTTP {status}: {data[:200]!r}")
     reply = json.loads(data)
     cost = charge((reply.get("usage") or {}).get("cost"), "other")
-    log_call("meeting_notes", NOTES_MODEL, "openrouter", t0, status, reply, cost_micro=cost)
+    log_call("meeting_notes", NOTES_FALLBACK_MODEL, "openrouter", t0, status, reply, cost_micro=cost)
     return (reply["choices"][0]["message"]["content"] or "").strip()
 
 

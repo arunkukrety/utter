@@ -342,6 +342,8 @@ def routes_for(user: str, q: dict) -> tuple:
 
 def clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     """Cleaned text, or the raw transcript if cleanup stalls or fails: a dictation is never lost to cleanup."""
+    if len(text.split()) < 3:  # "Yes.", "Thank you." — nothing to clean, so no cleanup call (its cost and ~0.25 s)
+        return text
     try:
         return _clean(text, provider, roman)
     except Exception as exc:

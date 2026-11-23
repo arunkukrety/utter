@@ -115,6 +115,9 @@ def flush() -> None:
                 del _pending[(user, day)]
             if day == today():
                 _used[user] = [row["dictations"], float(row["audio_seconds"])]
+            if user in _ladder:  # written costs leave _pending now, so count them in the spend until refresh re-reads it
+                budget, spent, steps = _ladder[user]
+                _ladder[user] = (budget, spent + sum(counts[2:]), steps)
 
 
 def now_iso() -> str:
@@ -324,6 +327,18 @@ if __name__ == "__main__":  # self-check, no network
     assert route_for("u") == ("aai", "orrace", "")  # 25% (+ a few pending µ$)
     _ladder["u"] = (4_000_000, 2_100_000, steps); assert route_for("u")[1] == "orslot2"  # 52%
     _ladder["u"] = (4_000_000, 9_000_000, steps); assert route_for("u")[0] == "whisper"  # past 100%: stays at 75%
+    # a flush must not make the spend drop: what it writes moves from _pending into the ladder's total
+    saved = dict(_pending)
+    _pending.clear()
+    _ladder["u"] = (4_000_000, 2_900_000, steps)
+    _pending[("u", today())] = [0, 0.0, 200_000, 0, 0, 0]
+    assert route_for("u")[0] == "whisper"  # 2.9M + 0.2M pending = 77.5%
+    real_rest = _rest
+    _rest = lambda *a, **k: [{"dictations": 0, "audio_seconds": 0}]  # noqa: E731  (no network in the self-check)
+    flush()
+    _rest = real_rest
+    assert ("u", today()) not in _pending and route_for("u")[0] == "whisper", _ladder["u"]
+    _pending.update(saved)
     del _ladder["u"]
     assert not meetings_allowed("u") and meetings_allowed("owner")
     _meetings.add("u"); assert meetings_allowed("u")

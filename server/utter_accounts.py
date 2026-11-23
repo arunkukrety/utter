@@ -22,6 +22,7 @@ _caps = {}     # user id -> (daily dictations, daily audio seconds)
 _routes = {}   # user id -> (stt model, cleanup route) from their plan
 _blocked = {}  # user id -> reason, for profiles.disabled
 _meetings = set()  # user ids whose plan includes meeting notes (plans.meetings)
+_ladder = {}   # user id -> (budget µ$, spent µ$ this billing period, [(from_pct, (stt model, cleanup, stt provider))])
 _seen = set()  # sha256 of keys used since the last flush, for api_keys.last_used_at
 _used = {}     # user id -> [dictations, seconds] today, as Supabase last told us
 _models = []   # [(model, provider)] for cleanup slots 1, 2, from public.cleanup_models; empty = the server's defaults
@@ -59,13 +60,19 @@ def _all(path: str) -> list:
 def refresh() -> None:
     day = today()
     keys = {r["key_hash"]: r["user_id"] for r in _all("api_keys?select=key_hash,user_id&revoked_at=is.null")}
-    profiles = _all("profiles?select=user_id,disabled,disabled_reason,"
-                    "plans(daily_dictations,daily_audio_seconds,stt_model,stt_provider,cleanup,meetings)")
+    profiles = _all("profiles?select=user_id,plan,disabled,disabled_reason,"
+                    "plans(daily_dictations,daily_audio_seconds,stt_model,stt_provider,cleanup,meetings,monthly_budget_micro)")
     caps = {r["user_id"]: (r["plans"]["daily_dictations"], r["plans"]["daily_audio_seconds"]) for r in profiles}
     routes = {r["user_id"]: (r["plans"]["stt_model"], r["plans"]["cleanup"], r["plans"]["stt_provider"] or "")
               for r in profiles}
     blocked = {r["user_id"]: r["disabled_reason"] or "" for r in profiles if r["disabled"]}
     meetings = {r["user_id"] for r in profiles if r["plans"].get("meetings")}
+    tiers = {}
+    for t in _all("plan_tiers?select=plan,from_pct,stt_model,stt_provider,cleanup&order=from_pct"):
+        tiers.setdefault(t["plan"], []).append((t["from_pct"], (t["stt_model"], t["cleanup"], t["stt_provider"] or "")))
+    spent = {r["user_id"]: int(r["spent_micro"]) for r in _all("period_spend?select=user_id,spent_micro")}
+    ladder = {r["user_id"]: (r["plans"]["monthly_budget_micro"], spent.get(r["user_id"], 0), tiers[r["plan"]])
+              for r in profiles if r["plans"].get("monthly_budget_micro") and tiers.get(r["plan"])}
     used = {r["user_id"]: [r["dictations"], float(r["audio_seconds"])]
             for r in _all(f"usage_daily?select=user_id,dictations,audio_seconds&day=eq.{day}")}
     models = [(r["model"], r["provider"]) for r in _all("cleanup_models?select=model,provider&order=slot")]
@@ -76,6 +83,7 @@ def refresh() -> None:
         _keys.clear(); _keys.update(keys)
         _caps.clear(); _caps.update(caps)
         _routes.clear(); _routes.update(routes)
+        _ladder.clear(); _ladder.update(ladder)
         _blocked.clear(); _blocked.update(blocked)
         _meetings.clear(); _meetings.update(meetings)
         _used.clear(); _used.update(used)
@@ -206,9 +214,15 @@ def user_for(key: str):
 
 
 def route_for(user: str):
-    """(stt model, cleanup route, stt provider or "") from the user's plan, or None for users without one (the owner,
-    keys.json)."""
+    """(stt model, cleanup route, stt provider or "") for the user's next dictation, or None for users without a plan (the
+    owner, keys.json). On a plan with a budget, the step of its ladder that this billing period's spend has reached,
+    counting costs not yet written to Supabase; else the plan's own routes."""
     with _lock:
+        if user in _ladder:
+            budget, spent, steps = _ladder[user]
+            spent += sum(_pending.get((user, today()), [0, 0])[2:])
+            pct = 100 * spent / budget
+            return next(route for from_pct, route in reversed(steps) if pct >= from_pct)  # steps start at 0
         return _routes.get(user)
 
 
@@ -305,6 +319,12 @@ if __name__ == "__main__":  # self-check, no network
     _routes["u"], _blocked["u"] = ("openai/whisper-large-v3-turbo", "orrace", "groq"), "spam"
     assert route_for("u")[0].startswith("openai/") and route_for("owner") is None
     assert blocked("u") == "This account is disabled: spam." and blocked("owner") is None
+    steps = [(0, ("aai", "orrace", "")), (50, ("aai", "orslot2", "")), (75, ("whisper", "orslot2", "groq"))]
+    _ladder["u"] = (4_000_000, 1_000_000, steps)
+    assert route_for("u") == ("aai", "orrace", "")  # 25% (+ a few pending µ$)
+    _ladder["u"] = (4_000_000, 2_100_000, steps); assert route_for("u")[1] == "orslot2"  # 52%
+    _ladder["u"] = (4_000_000, 9_000_000, steps); assert route_for("u")[0] == "whisper"  # past 100%: stays at 75%
+    del _ladder["u"]
     assert not meetings_allowed("u") and meetings_allowed("owner")
     _meetings.add("u"); assert meetings_allowed("u")
     before = list(_pending[("u", today())]); record_audio("u", 60)

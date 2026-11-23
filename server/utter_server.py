@@ -337,7 +337,7 @@ def routes_for(user: str, q: dict) -> tuple:
     if plan:
         return "openrouter", plan[0], plan[1], plan[2]
     return (pick(q, "stt", DEFAULT_STT, ("direct", "surplus", "groq", "openrouter", "cartesia")), "",
-            pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace")), "")
+            pick(q, "cleanup", DEFAULT_CLEANUP, ("groq", "surplus", "none", "openrouter", "cerebras", "race", "orrace", "orslot1", "orslot2")), "")
 
 
 def clean(text: str, provider: str = "groq", roman: bool = False) -> str:
@@ -363,11 +363,15 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     msgs = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
     if provider == "race":
         return _race(msgs, len(text.split()), DIRECT_RACERS)
-    if provider == "orrace":
+    if provider in ("orrace", "orslot1", "orslot2"):  # both cleanup_models racing, or one of them alone (the cost cap)
+        racers, first = openrouter_racers(), 1
+        if provider != "orrace":
+            first = int(provider[-1])
+            racers = racers[first - 1:first]
         try:
-            return _race(msgs, len(text.split()), openrouter_racers())
+            return _race(msgs, len(text.split()), racers, first)
         except Exception as exc:
-            print(time.strftime("%H:%M:%S"), f"orrace cleanup failed ({str(exc)[:160]}); using cerebras", flush=True)
+            print(time.strftime("%H:%M:%S"), f"{provider} cleanup failed ({str(exc)[:160]}); using cerebras", flush=True)
             return _clean(text, "cerebras", roman)
     if provider == "surplus":
         body = json.dumps({"model": SURPLUS_CLEANUP_MODEL, "temperature": 0, "max_tokens": 2 * len(text.split()) + 512,
@@ -570,11 +574,12 @@ def _ask(part: str, name: str, race: dict, host: str, path: str, key: str, extra
     return out.replace("\u2011", "-")  # gpt-oss writes non-breaking hyphens ("pre\u2011Vercel"); type a plain one
 
 
-def _race(msgs: list, words: int, racers: tuple) -> str:
+def _race(msgs: list, words: int, racers: tuple, first_slot: int = 1) -> str:
+    """The first good answer of the racers; first_slot numbers them for billing (slot 2 alone stays cleanup_model2)."""
     race = {}  # the first racer to answer well claims "winner" here, for the call log
     jobs = {_racers.submit(contextvars.copy_context().run, _ask, f"cleanup_model{i}", name, race, host, path, key, extra,
                            msgs, words): name
-            for i, (name, host, path, key, extra) in enumerate(racers, 1)}  # billed by slot, so a model swap keeps columns
+            for i, (name, host, path, key, extra) in enumerate(racers, first_slot)}  # billed by slot: a model swap keeps columns
     pending, errors = set(jobs), []
     while pending:
         done, pending = wait(pending, return_when=FIRST_COMPLETED)

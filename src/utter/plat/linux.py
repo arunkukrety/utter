@@ -1,6 +1,6 @@
 """Linux (GNOME on Wayland): parecord for the mic, wl-copy + ydotool to paste and type, GNOME custom shortcuts for the
 hotkey (it runs the `utter` command, which signals this process), a systemd user service for start at login."""
-import ast, asyncio, json, os, re, shutil, subprocess, time
+import ast, asyncio, json, os, re, shutil, subprocess, threading, time
 
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "utter")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "utter")
@@ -64,41 +64,88 @@ def play(path: str) -> None:
         pass
 
 
-def duck(level: float) -> list:
-    """Turn every app that is playing (not paused) down to `level` (0..1) of its own volume, through PipeWire's per-app
-    volumes: the system volume and Utter's own sounds are left alone. Returns what unduck() needs to put them back."""
+def _playing() -> dict:
+    """{stream index: [volume per channel]} for every app playing now (not paused), Utter's own beeps left out."""
     try:
         out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"], capture_output=True, text=True,
                              timeout=2).stdout
         streams = json.loads(out or "[]")
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return []
-    ducked = []
-    for s in streams:
-        props = s.get("properties") or {}
-        if s.get("corked") or props.get("application.process.binary") == "paplay":  # paused, or our own beep
-            continue
-        before = [int(c.get("value", 0)) for c in (s.get("volume") or {}).values()]
-        if not before:
-            continue
-        try:
-            subprocess.run(["pactl", "set-sink-input-volume", str(s["index"]),
-                            *[str(int(v * level)) for v in before]], timeout=2, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            ducked.append((s["index"], before))
-        except (OSError, subprocess.SubprocessError):
-            pass
-    return ducked
+        return {}
+    return {s["index"]: [int(c.get("value", 0)) for c in (s.get("volume") or {}).values()]
+            for s in streams if not s.get("corked")
+            and (s.get("properties") or {}).get("application.process.binary") != "paplay" and s.get("volume")}
 
 
-def unduck(ducked: list) -> None:
-    """Put back exactly the volumes duck() changed; a stream that has ended since is skipped."""
-    for index, before in ducked:
-        try:
-            subprocess.run(["pactl", "set-sink-input-volume", str(index), *map(str, before)], timeout=2,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError):
-            pass
+def _set_volume(index: int, volumes: list) -> None:
+    try:
+        subprocess.run(["pactl", "set-sink-input-volume", str(index), *map(str, volumes)], timeout=2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+_duck_lock = threading.Lock()
+_ducking = None  # the Ducker now in charge of other apps' volumes
+
+
+class Ducker:
+    """Other apps' volumes while you dictate: glides every playing app down to `level` (0..1) of its own volume, holds
+    it there, and on release() glides it back up, all on its own thread, so neither the mic nor the text ever waits.
+    Uses PipeWire's per-app volumes: the system volume and Utter's own beeps are left alone. A new dictation that starts
+    while the last one is still fading back takes over from where the volume is, and still restores the volume each app
+    had before either dictation, so repeated dictations never leave the music a little quieter each time."""
+    STEP_S = 0.04
+
+    def __init__(self, level: float, down_s: float = 0.35, up_s: float = 0.8) -> None:
+        global _ducking
+        self.level, self.down_s, self.up_s = level, down_s, up_s
+        self.released, self.taken_over = threading.Event(), threading.Event()
+        self.before, self.frac = {}, {}  # index -> the app's own volume; index -> share of it now
+        with _duck_lock:
+            self.previous, _ducking = _ducking, self
+        if self.previous:
+            self.previous.taken_over.set()
+        self.thread = threading.Thread(target=self._run, name="duck", daemon=True)
+        self.thread.start()
+
+    def release(self) -> None:
+        """Start gliding back up. Returns at once; safe to call more than once."""
+        self.released.set()
+
+    def _glide(self, to: float, seconds: float) -> bool:
+        """Move every stream from where it is to `to` of its own volume. False if a newer Ducker took over."""
+        start = dict(self.frac)
+        steps = max(1, int(seconds / self.STEP_S))
+        for i in range(1, steps + 1):
+            if self.taken_over.is_set():
+                return False
+            for index, before in self.before.items():
+                self.frac[index] = start[index] + (to - start[index]) * i / steps
+                _set_volume(index, [int(v * self.frac[index]) for v in before])
+            time.sleep(self.STEP_S)
+        return True
+
+    def _run(self) -> None:
+        inherited = {}
+        if self.previous:  # it stops at its next step; take over its streams where they are
+            self.previous.thread.join(timeout=1)
+            inherited = {i: (self.previous.before[i], self.previous.frac.get(i, 1.0)) for i in self.previous.before}
+        for index, now in _playing().items():
+            before, frac = inherited.get(index, (now, 1.0))
+            self.before[index], self.frac[index] = before, frac
+        if not self.before or not self._glide(self.level, self.down_s):
+            return
+        while not self.released.wait(0.05):  # hold while you talk
+            if self.taken_over.is_set():
+                return
+        if self._glide(1.0, self.up_s):
+            for index, before in self.before.items():  # exactly the volume it had, not a rounded one
+                _set_volume(index, before)
+        with _duck_lock:
+            global _ducking
+            if _ducking is self:
+                _ducking = None
 
 
 def notify(msg: str) -> None:

@@ -326,10 +326,10 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
         return
     DICTATION.update(running=True, cancelled=False)
     # other audio (music, a video, a call) is turned down while you talk, and back up the moment recording stops
-    ducking = None
-    if setting("duck_media") is not False and hasattr(plat, "duck"):
+    ducker = None  # glides other audio down now and back up on release(), on its own thread: nothing here waits for it
+    if setting("duck_media") is not False and hasattr(plat, "Ducker"):
         level = (setting("duck_level") if isinstance(setting("duck_level"), (int, float)) else DUCK_LEVEL) / 100
-        ducking = asyncio.ensure_future(asyncio.to_thread(plat.duck, level))
+        ducker = plat.Ducker(level)
     rec = await plat.open_mic(setting("mic"))
     popup.begin()
     roman = setting("hindi") != "devanagari"  # Hindi as Roman Hinglish unless Settings says Devanagari
@@ -337,11 +337,9 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
     mic_off = asyncio.Event()
     audio_chunks = {"n": 0}
 
-    async def restore_audio() -> None:
-        nonlocal ducking
-        if ducking is not None:
-            task, ducking = ducking, None
-            await asyncio.to_thread(plat.unduck, await task)
+    def restore_audio() -> None:
+        if ducker is not None:
+            ducker.release()
 
     async def send_audio():
         first, n = True, 0
@@ -370,7 +368,7 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
         popup.stopped()
         mic_off.set()
         rec.stop()
-        await restore_audio()  # music comes back now, not when the text arrives
+        restore_audio()  # music starts gliding back now, not when the text arrives
         await sender
         # whatever the server heard is pasted, however short: a filter for Whisper's invented "Thank you." threw away
         # real one- and two-word dictations ("Yeah.", "Hey man.") on short clips in a noisy room
@@ -383,7 +381,7 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
             LOG(f"stop -> text: {(time.monotonic() - stopped_at) * 1000:.0f} ms")
     finally:
         rec.stop()
-        await restore_audio()  # also after a cancel or an error
+        restore_audio()  # also after a cancel or an error
         await server.close()
         WARM_NOW.set()  # open the next connection now, not at the next press
         cancelled = DICTATION["cancelled"]

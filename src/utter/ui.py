@@ -9,7 +9,8 @@ It never takes focus, or the pasted text would land in the pill instead of the a
 import json, math, os, sys, threading, time, urllib.error, urllib.request
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon, QPainter
+from PySide6.QtGui import (QAction, QColor, QConicalGradient, QDesktopServices, QFont, QFontMetrics, QGuiApplication,
+                           QIcon, QPainter, QPen)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QMenu, QPushButton, QRadioButton, QScrollArea, QStackedWidget,
                                QSystemTrayIcon, QVBoxLayout, QWidget)
@@ -172,6 +173,92 @@ class Pill(QWidget):
                 self.history = (self.history + [max(0.0, min(1.0, float(line[2:])))])[-BARS:]
             except ValueError:
                 pass
+
+
+# ---- the meeting pill -----------------------------------------------------------------------------------------------
+GLOW = 5  # room around the pill for the border's glow
+SHINE = [(0.0, "#a78bfa"), (0.33, "#22d3ee"), (0.66, "#f472b6"), (1.0, "#a78bfa")]  # violet, cyan, pink
+
+
+class MeetingPill(QWidget):
+    """Shown for the whole of a meeting recording, just above where the dictation pill appears: a slowly turning
+    violet-cyan-pink border with a soft glow sets it apart from dictation, a pulsing red dot and the time recorded so
+    far. After the stop it says "Writing notes…" until they are ready."""
+    state = Signal(str)  # "rec", "writing", "done": from the meeting's own thread, run on this one
+
+    def __init__(self) -> None:
+        flags = Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
+        if sys.platform.startswith("linux"):
+            flags |= Qt.X11BypassWindowManagerHint
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.font_ = QFont()
+        self.font_.setPixelSize(13)
+        self.started, self.writing, self.text = 0.0, False, ""
+        self.timer = QTimer(self, interval=33, timeout=self.tick)  # ~30 fps, only while shown
+        self.state.connect(self.on_state)
+
+    def on_state(self, state: str) -> None:
+        if state == "rec":
+            self.started, self.writing = time.monotonic(), False
+            self.setWindowOpacity(1.0)
+            self.show()
+            self.timer.start()
+        elif state == "writing":
+            self.writing = True
+        else:  # done
+            self.timer.stop()
+            self.hide()
+        self.tick()
+
+    def tick(self) -> None:
+        if self.writing:
+            self.text = "Writing meeting notes…"
+        else:
+            s = int(time.monotonic() - self.started)
+            self.text = f"Meeting notes · {s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else \
+                f"Meeting notes · {s // 60}:{s % 60:02d}"
+        fm = QFontMetrics(self.font_)
+        w = GLOW * 2 + PAD_X * 2 + 14 + GAP + max(fm.horizontalAdvance(t) for t in
+                                                 ("Meeting notes · 0:00:00", "Writing meeting notes…"))
+        h = GLOW * 2 + METER_H + PAD_Y * 2
+        if self.size().width() != w or self.size().height() != h:
+            self.resize(w, h)
+        area = QGuiApplication.primaryScreen().availableGeometry()
+        dictation_pill = METER_H + PAD_Y * 2
+        self.move(area.x() + (area.width() - w) // 2,
+                  area.y() + area.height() - BOTTOM_GAP - dictation_pill - 10 - h + GLOW)
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        box = QRectF(self.rect()).adjusted(GLOW, GLOW, -GLOW, -GLOW)
+        r = box.height() / 2
+        turn = (time.monotonic() * 90) % 360  # one turn every 4 s
+        shine = QConicalGradient(box.center(), turn)
+        for at, color in SHINE:
+            shine.setColorAt(at, QColor(color))
+        for width, alpha in ((GLOW * 2, 40), (GLOW, 70)):  # the soft glow, widest and faintest first
+            glow = QConicalGradient(shine)
+            for at, color in SHINE:
+                c = QColor(color)
+                c.setAlpha(alpha)
+                glow.setColorAt(at, c)
+            p.setPen(QPen(glow, width))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(box, r, r)
+        p.setPen(QPen(shine, 2))
+        p.setBrush(QColor(24, 24, 27, 240))
+        p.drawRoundedRect(box, r, r)
+        p.setPen(Qt.NoPen)
+        pulse = 0.55 + 0.45 * math.sin(time.monotonic() * 3)  # the dot breathes while recording
+        p.setBrush(QColor(161, 161, 171) if self.writing else QColor(240, 69, 69, int(255 * pulse)))
+        p.drawEllipse(QPointF(box.x() + PAD_X + 5, box.center().y()), 4.5, 4.5)
+        p.setPen(QColor("#f4f4f5"))
+        p.setFont(self.font_)
+        p.drawText(box.adjusted(PAD_X + 14 + GAP, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self.text)
 
 
 # ---- settings and keys on disk --------------------------------------------------------------------------------------
@@ -648,11 +735,16 @@ def make_tray(window: Window) -> QSystemTrayIcon:
         from .meeting import MEETING
         meeting = QAction("Start meeting notes", menu)
 
-        def on_meeting() -> None:
-            meeting.setText("Stop meeting notes" if MEETING.toggle() else "Start meeting notes")
+        pill = MeetingPill()
+        MEETING.on_state = pill.state.emit  # the pill follows the recording, from whichever thread reports it
 
+        def on_meeting() -> None:  # the menu item and Alt+M (`utter meeting`) both land here
+            meeting.setText("Stop meeting notes  (Alt+M)" if MEETING.toggle() else "Start meeting notes  (Alt+M)")
+
+        meeting.setText("Start meeting notes  (Alt+M)")
         meeting.triggered.connect(on_meeting)
         menu.insertAction(menu.actions()[3], meeting)  # above Settings' separator, with the other actions
+        tray.toggle_meeting, tray._meeting_pill = on_meeting, pill
     tray.setContextMenu(menu)
     if sys.platform == "win32":  # a left click on Windows opens the window; the menu is on the right click
         tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger and window.open("history"))

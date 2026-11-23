@@ -36,6 +36,8 @@ def _join(paths: list) -> bytes:
 class Meeting:
     def __init__(self) -> None:
         self.dir, self.started, self.procs = None, None, []
+        # told "rec" (recording), "writing" (stopped, notes on their way) and "done"; may be called from any thread
+        self.on_state = lambda state: None
 
     @property
     def recording(self) -> bool:
@@ -59,7 +61,7 @@ class Meeting:
             rec.stdout.close()  # the encoder owns the pipe now
             self.procs += [rec, enc]
         core.LOG(f"meeting: recording to {self.dir}")
-        core.notify("Recording meeting notes. Stop it from the Utter menu.")
+        self.on_state("rec")
 
     def stop(self) -> None:
         """Stop recording and write the notes in the background."""
@@ -72,8 +74,15 @@ class Meeting:
                 p.kill()
         self.procs = []
         folder, started = self.dir, self.started
-        core.notify("Meeting stopped. Writing the notes…")
-        threading.Thread(target=lambda: asyncio.run(_finish(folder, started)), name="meeting", daemon=True).start()
+        self.on_state("writing")
+
+        def finish() -> None:
+            try:
+                asyncio.run(_finish(folder, started))
+            finally:
+                self.on_state("done")
+
+        threading.Thread(target=finish, name="meeting", daemon=True).start()
 
     def toggle(self) -> bool:
         """Start or stop; True while recording."""

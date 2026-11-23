@@ -1,7 +1,8 @@
 """Starts Utter: the Qt UI on the main thread, the dictation engine (utter.core) on its own thread.
 
 Linux: run by the systemd user service `utter`; the `utter` command (bin/utter) and the hold-to-talk helper send it
-signals: SIGUSR1 starts/stops a dictation, SIGRTMIN cancels one, SIGHUP re-reads the API key, SIGUSR2 opens the window.
+signals: SIGUSR1 starts/stops a dictation, SIGRTMIN cancels one, SIGHUP re-reads the API key, SIGUSR2 opens the window,
+SIGRTMIN+1 starts/stops meeting notes (Alt+M).
 macOS / Windows: the hotkeys live in the app. One copy runs; opening the app again shows its window instead.
 `--background` (used by start at login) starts it without opening the window.
 """
@@ -15,6 +16,7 @@ if LINUX:
     # an unhandled SIGUSR1 kills the process, and an early Alt+D can land before the real handlers are installed
     signal.signal(signal.SIGUSR1, lambda *_: EARLY.append("press"))
     signal.signal(signal.SIGRTMIN, lambda *_: EARLY.append("cancel"))
+    signal.signal(signal.SIGRTMIN + 1, signal.SIG_IGN)  # Alt+M before the tray exists: ignored, never fatal
     signal.signal(signal.SIGUSR2, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
@@ -96,7 +98,7 @@ def main() -> None:
     threading.Thread(target=core.run, args=(pill.line.emit,), name="engine", daemon=True).start()
 
     if LINUX:
-        _linux_signals(app, window, core)
+        _linux_signals(app, window, core, tray)
     elif "--background" not in sys.argv:
         window.open("history")
     code = app.exec()
@@ -106,7 +108,7 @@ def main() -> None:
     os._exit(code)
 
 
-def _linux_signals(app, window, core) -> None:
+def _linux_signals(app, window, core, tray) -> None:
     """Python runs signal handlers only when it gets control, and Qt's loop holds it in C: a wake-up socket makes Qt
     hand control back the moment a signal lands."""
     import signal, socket
@@ -129,6 +131,7 @@ def _linux_signals(app, window, core) -> None:
     signal.signal(signal.SIGRTMIN, lambda *_: core.cancel())
     signal.signal(signal.SIGHUP, lambda *_: core.reload_key())
     signal.signal(signal.SIGUSR2, lambda *_: window.open("history"))
+    signal.signal(signal.SIGRTMIN + 1, lambda *_: tray.toggle_meeting())  # Alt+M: `utter meeting`
     signal.signal(signal.SIGTERM, lambda *_: app.quit())
     for kind in EARLY:
         core.press() if kind == "press" else core.cancel()

@@ -544,6 +544,31 @@ class Window(QWidget):
         add(dim("Takes effect on your next dictation. If the chosen mic is unplugged, the system default is used. "
                 f"Every dictation is pasted with {plat.PASTE_KEYS} and also copied to the clipboard and History."))
 
+        if sys.platform.startswith("linux"):  # turning other apps down needs PipeWire's per-app volumes
+            add(title("While you dictate"))
+            duck = QCheckBox("Lower other audio (music, videos, calls) while I talk")
+            duck.setChecked(cfg.get("duck_media") is not False)
+            levels = QComboBox()
+            for pct in (0, 10, 20, 30, 50, 70):
+                levels.addItem("Mute it" if pct == 0 else f"To {pct}% of its volume", pct)
+            current_level = cfg.get("duck_level", core.DUCK_LEVEL)
+            levels.setCurrentIndex(max(0, levels.findData(current_level)))
+            levels.setEnabled(duck.isChecked())
+
+            def on_duck(on: bool) -> None:
+                update_settings(duck_media=on)  # read at each press
+                levels.setEnabled(on)
+
+            duck.toggled.connect(on_duck)
+            levels.currentIndexChanged.connect(lambda i: update_settings(duck_level=levels.itemData(i)))
+            add(duck)
+            level_row = QHBoxLayout()
+            level_row.addWidget(levels)
+            level_row.addStretch(1)
+            page.addLayout(level_row)
+            add(dim("Only apps that are playing are turned down, and each goes back to its own volume the moment you "
+                    "stop talking. Your system volume is not changed."))
+
         version = title(f"Utter {VERSION}")
         add(version)
         check = QPushButton("Check for updates")

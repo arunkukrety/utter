@@ -64,6 +64,43 @@ def play(path: str) -> None:
         pass
 
 
+def duck(level: float) -> list:
+    """Turn every app that is playing (not paused) down to `level` (0..1) of its own volume, through PipeWire's per-app
+    volumes: the system volume and Utter's own sounds are left alone. Returns what unduck() needs to put them back."""
+    try:
+        out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"], capture_output=True, text=True,
+                             timeout=2).stdout
+        streams = json.loads(out or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    ducked = []
+    for s in streams:
+        props = s.get("properties") or {}
+        if s.get("corked") or props.get("application.process.binary") == "paplay":  # paused, or our own beep
+            continue
+        before = [int(c.get("value", 0)) for c in (s.get("volume") or {}).values()]
+        if not before:
+            continue
+        try:
+            subprocess.run(["pactl", "set-sink-input-volume", str(s["index"]),
+                            *[str(int(v * level)) for v in before]], timeout=2, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ducked.append((s["index"], before))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ducked
+
+
+def unduck(ducked: list) -> None:
+    """Put back exactly the volumes duck() changed; a stream that has ended since is skipped."""
+    for index, before in ducked:
+        try:
+            subprocess.run(["pactl", "set-sink-input-volume", str(index), *map(str, before)], timeout=2,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def notify(msg: str) -> None:
     try:
         os.spawnlp(os.P_NOWAIT, "notify-send", "notify-send", "-t", "4000", "-i", "utter", "Utter", msg)

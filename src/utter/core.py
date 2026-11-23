@@ -262,20 +262,6 @@ class ServerStream:
                 pass
 
 
-# What Whisper says when it hears nothing. Matched on the whole transcript, never on part of a real sentence.
-GHOSTS = {"thank you", "thank you for watching", "thanks for watching", "thank you very much", "thanks", "you", "bye",
-          "okay", "ok", "so", "uh", "um", "hmm", "please subscribe", "subtitles by the amara org community"}
-
-
-def is_ghost(text: str, popup) -> bool:
-    """Discard only a known silence filler, or a very short result from near-silent audio. A real sentence from a quiet
-    mic must never be thrown away (that lost a whole dictation once), so loudness alone decides nothing."""
-    words = "".join(c.lower() if c.isalnum() or c == " " else " " for c in text).split()
-    if not words or " ".join(words) in GHOSTS:
-        return True
-    return len(words) <= 2 and not popup.heard_speech()
-
-
 def keep(text: str, raw: str = "") -> None:
     """Copy the whole dictation to the clipboard (so it can be pasted again if no field had focus) and save it."""
     if not text:
@@ -335,11 +321,9 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
         mic_off.set()
         rec.stop()
         await sender
+        # whatever the server heard is pasted, however short: a filter for Whisper's invented "Thank you." threw away
+        # real one- and two-word dictations ("Yeah.", "Hey man.") on short clips in a noisy room
         served = None if DICTATION["cancelled"] else await server.finish()
-        if served and is_ghost(served.get("raw") or served.get("text", ""), popup):
-            # Whisper invents phrases like "Thank you." in silence
-            LOG(f"looks like Whisper's silence filler, not speech; ignoring {served.get('text', '')!r}")
-            served = None
         if served:
             raw = romanize(served["raw"]) if roman else served["raw"]
             text = romanize(served["text"]) if roman else served["text"]

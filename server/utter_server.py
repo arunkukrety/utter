@@ -415,17 +415,69 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
 
 
 NOTES_MODEL = os.environ.get("NOTES_MODEL", "openai/gpt-oss-120b")
-NOTES_PROMPT = """You write meeting notes from a transcript. Lines look like "[12:00] You: ..." (the person who recorded
-the meeting) or "[12:00] Others: ..." (everyone else on the call, mixed together); the time is the minute it was said.
+NOTES_PROMPT = """You write meeting notes from a transcript. Lines look like "[12:00:05] You: ..." (the person who
+recorded the meeting) or "[12:00:09] Speaker 2: ..." (someone else on the call; the same number is the same person,
+except that numbering restarts every 25 minutes of the call). A line may say "Others" when the voices could not be
+told apart. When the conversation shows who a speaker is ("thanks, Priya"), use that name instead of the number.
 The transcript is raw speech-to-text: expect fillers, false starts and misheard words, and read past them.
 Write Markdown with these sections, leaving out any that would be empty:
 ## Summary — 2 to 5 sentences: what the meeting was about and how it ended.
 ## Key points — the substance, as short bullets, in the order it came up.
 ## Decisions — what was agreed.
-## Action items — "- [ ] who: what (by when)", using You, Others or a name if one was said.
+## Action items — "- [ ] who: what (by when)", using You, a name, or the speaker's number.
 ## Open questions — what was raised and not settled.
 Use only what is in the transcript: never invent names, numbers, dates or decisions. Write numbers as digits. Keep the
 language the meeting was held in; Hindi or Hinglish stays in Roman letters. Reply with only the notes."""
+
+# Meeting tracks go to ElevenLabs Scribe through the Surplus key market as whole recordings (up to 25 minutes a part):
+# speaker labels on the others' track, real timestamps on both, Hindi and Hinglish handled. $0.04 an hour there (80% off
+# ElevenLabs' $0.20, 2026-11-24); diarization costs nothing extra. Not latency-sensitive: notes are written after the call.
+MEETING_STT_TIMEOUT_S = 240
+
+
+def meeting_segments(ogg: bytes, language: str, diarize: bool, stt_route: str, stt_model: str,
+                     stt_provider: str) -> list:
+    """A meeting track -> [{"speaker", "start", "end", "text"}], times in seconds from the start of the audio. Speakers
+    are "Speaker 1", "Speaker 2"... in order of first appearance when diarize is on, else None. If Scribe through Surplus
+    fails, the plan's own speech-to-text gives one unlabelled segment, so the notes still get written."""
+    t0 = time.monotonic()
+    try:
+        mp3 = to_mp3(ogg)  # the key market prices WAV and MP3 only
+        b = "utter" + secrets.token_hex(8)
+        fields = {"model_id": SCRIBE_MODEL, "diarize": "true" if diarize else "false", "tag_audio_events": "false",
+                  "timestamps_granularity": "word"}
+        body = b"".join(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+                        for k, v in fields.items())
+        body += (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"track.mp3\"\r\n"
+                 f"Content-Type: audio/mpeg\r\n\r\n").encode() + mp3 + f"\r\n--{b}--\r\n".encode()
+        c = http.client.HTTPSConnection("api.surplusintelligence.ai", timeout=MEETING_STT_TIMEOUT_S)  # its own: we need the headers
+        c.request("POST", "/v1/resources/elevenlabs/v1/speech-to-text", body,
+                  {"xi-api-key": SURPLUS_KEY, "Content-Type": f"multipart/form-data; boundary={b}"})
+        r = c.getresponse()
+        data, cost_micro = r.read(), int(r.getheader("x-si-buyer-cost-micro") or 0)
+        c.close()
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}: {data[:150]!r}")
+        reply = json.loads(data)
+        charge(cost_micro / 1_000_000, "other")  # exactly what Surplus billed
+        log_call("stt", SCRIBE_MODEL + ("+diarize" if diarize else ""), "surplus", t0, 200, cost_micro=cost_micro)
+        names, segs = {}, []
+        for w in reply.get("words") or []:
+            if w.get("type") != "word" or not (w.get("text") or "").strip():
+                continue
+            who = names.setdefault(w.get("speaker_id"), f"Speaker {len(names) + 1}") if diarize else None
+            last = segs[-1] if segs else None
+            if last and last["speaker"] == who and w["start"] - last["end"] < 1.5 and last["end"] - last["start"] < 30:
+                last["text"] += " " + w["text"].strip()
+                last["end"] = w["end"]
+            else:
+                segs.append({"speaker": who, "start": w["start"], "end": w["end"], "text": w["text"].strip()})
+        return segs
+    except Exception as exc:
+        print(time.strftime("%H:%M:%S"), f"meeting stt via surplus failed ({str(exc)[:150]}); using {stt_route}", flush=True)
+        log_call("stt", SCRIBE_MODEL, "surplus", t0, 0, error=str(exc))
+        text = transcribe(ogg, language, stt_route, "ogg", stt_model, stt_provider)
+        return [{"speaker": None, "start": 0.0, "end": accounts.audio_seconds(ogg, "ogg"), "text": text}] if text else []
 
 
 def meeting_notes(transcript: str, language: str) -> str:
@@ -717,19 +769,21 @@ async def stream_handler(ws, path=None):
                     return
                 did = start_dictation(user)  # the threads below inherit its bill and call-log tag
                 script = "roman" if roman else "devanagari"
-                if mode == "meeting":  # transcript only; meeting audio is never saved to disk
+                if mode == "meeting":  # a meeting track -> timed segments; meeting audio is never saved to disk
                     _bill.set(lambda part, micro: accounts.add_cost(user, "other", micro))
                     t = time.monotonic()
+                    diarize = q.get("diarize", ["0"])[0] == "1"
                     try:
-                        raw = await asyncio.to_thread(transcribe, bytes(audio), language, stt_route, "ogg", stt_model,
-                                                      stt_provider)
+                        segs = await asyncio.to_thread(meeting_segments, bytes(audio), language, diarize, stt_route,
+                                                       stt_model, stt_provider)
                     except Exception as exc:
                         log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, "meeting", error=str(exc))
                         await ws.send(json.dumps({"error": "transcription failed"}))
                         return
                     accounts.record_audio(user, accounts.audio_seconds(bytes(audio), "ogg"))
-                    result = {"text": raw, "raw": raw, "stt_ms": round((time.monotonic() - t) * 1000), "cleanup_ms": 0,
-                              "total_ms": round((time.monotonic() - t) * 1000)}
+                    raw = " ".join(s["text"] for s in segs)
+                    result = {"segments": segs, "text": raw, "raw": raw, "stt_ms": round((time.monotonic() - t) * 1000),
+                              "cleanup_ms": 0, "total_ms": round((time.monotonic() - t) * 1000)}
                     log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, "meeting", result)
                     await ws.send(json.dumps(result))
                     return

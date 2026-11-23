@@ -2,9 +2,9 @@
 
 Two tracks are recorded side by side: your mic ("You") and what your speakers play ("Others", PipeWire's monitor of
 the default output). Each is encoded to Opus and cut into one-minute files on disk while the meeting runs, so a crash
-loses at most a minute. When you stop, every minute of both tracks is transcribed by the Utter server (mode=meeting,
-the plan's speech-to-text, no cleanup), the lines are merged by minute, and the server writes notes from that
-(mode=notes). Transcript and notes are saved as Markdown in DATA/meetings/<when>/ and the notes are opened; the audio
+loses at most a minute. When you stop, each track is joined into parts of up to 25 minutes and transcribed by the
+Utter server (mode=meeting: ElevenLabs Scribe through the Surplus key market, with speaker labels on the others' track),
+the lines are merged by their real timestamps, and the server writes notes from that (mode=notes). Transcript and notes are saved as Markdown in DATA/meetings/<when>/ and the notes are opened; the audio
 is deleted once the notes exist. The server allows this only on plans with meeting notes (Pro) and for the owner key.
 
 Headphones work best: on speakers your mic also hears the others, and their words then show up under "You" too.
@@ -17,7 +17,20 @@ from . import core
 
 SEGMENT_S = 60
 TRACKS = {"you": "You", "others": "Others"}
-PARALLEL = 4  # minutes transcribed at once
+PART_MINUTES = 25  # minutes joined into one transcription request (the server's speech-to-text takes up to 30)
+PARALLEL = 4  # parts transcribed at once
+
+
+def _join(paths: list) -> bytes:
+    """One-minute Opus files -> one Ogg Opus stream, in order."""
+    lst = os.path.join(os.path.dirname(paths[0]), ".join.txt")
+    with open(lst, "w") as f:
+        f.writelines("file '%s'\n" % p.replace("'", "'\\''") for p in paths)
+    try:
+        return subprocess.run([core.FFMPEG, "-v", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c:a", "libopus",
+                               "-b:a", "16k", "-application", "voip", "-f", "ogg", "pipe:1"], capture_output=True).stdout
+    finally:
+        os.remove(lst)
 
 
 class Meeting:
@@ -91,30 +104,42 @@ async def _finish(folder: str, started: float) -> None:
         files = sorted(glob.glob(os.path.join(folder, "*-*.ogg")))
         gate = asyncio.Semaphore(PARALLEL)
 
-        async def one(path: str):
-            track, minute = re.match(r"(\w+)-(\d+)\.ogg$", os.path.basename(path)).groups()
-            if os.path.getsize(path) < 2000:  # a near-empty last file
-                return int(minute), track, ""
+        async def one(track: str, index: int, minutes: list):
+            """One part (up to PART_MINUTES one-minute files) of one track, joined, -> (start offset s, track, segments)."""
+            offset = int(re.search(r"-(\d+)\.ogg$", minutes[0]).group(1)) * SEGMENT_S
+            audio = _join(minutes)
+            if len(audio) < 2000:  # nothing recorded
+                return offset, track, []
+            q = f"&mode=meeting&diarize={1 if track == 'others' else 0}"  # speakers are told apart on the others' track
             async with gate:
                 for attempt in (1, 2):
                     try:
-                        reply = await _ask(url + "&mode=meeting", token, open(path, "rb").read(), 90)
+                        reply = await _ask(url + q, token, audio, 300)
                         if reply.get("notice"):
                             raise PermissionError(reply["notice"])
-                        return int(minute), track, (reply.get("text") or "").strip()
+                        if reply.get("error"):
+                            raise RuntimeError(reply["error"])
+                        return offset, track, reply.get("segments") or []
                     except PermissionError:
                         raise
                     except Exception as exc:
                         if attempt == 2:
-                            core.LOG(f"meeting: {os.path.basename(path)} failed ({str(exc)[:100]})")
-                            return int(minute), track, "[this minute could not be transcribed]"
+                            core.LOG(f"meeting: {track} part {index + 1} failed ({str(exc)[:100]})")
+                            return offset, track, [{"speaker": None, "start": 0, "end": 0,
+                                                    "text": "[this part could not be transcribed]"}]
 
-        parts = await asyncio.gather(*(one(f) for f in files))
+        jobs = []
+        for track in TRACKS:
+            minutes = sorted(f for f in files if os.path.basename(f).startswith(track + "-"))
+            for i in range(0, len(minutes), PART_MINUTES):
+                jobs.append(one(track, i // PART_MINUTES, minutes[i:i + PART_MINUTES]))
         lines = []
-        for minute, track, text in sorted(parts, key=lambda p: (p[0], p[1] != "you")):
-            if text:
-                stamp = time.strftime("%H:%M", time.localtime(started + minute * SEGMENT_S))
-                lines.append(f"[{stamp}] {TRACKS[track]}: {text}")
+        for offset, track, segs in await asyncio.gather(*jobs):
+            for s in segs:
+                who = "You" if track == "you" else (s.get("speaker") or "Others")
+                lines.append((offset + s["start"], f"{who}: {s['text']}"))
+        lines.sort(key=lambda x: x[0])
+        lines = [f"[{time.strftime('%H:%M:%S', time.localtime(started + at))}] {text}" for at, text in lines]
         transcript = "\n".join(lines)
         when = time.strftime("%A %d %B %Y, %H:%M", time.localtime(started))
         with open(os.path.join(folder, "transcript.md"), "w") as f:

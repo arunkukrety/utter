@@ -88,7 +88,7 @@ def log_dictation(did: str, user: str, audio: bytes, fmt: str, language: str, sc
         "id": did, "at": accounts.now_iso(), "language": language, "script": script, "stt_route": stt_route,
         "cleanup_route": cleaner, "audio_seconds": round(accounts.audio_seconds(audio, fmt), 2),
         "upload_kb": len(audio) // 1024, "stt_ms": r.get("stt_ms"), "cleanup_ms": r.get("cleanup_ms"),
-        "total_ms": r.get("total_ms"), "head_start": r.get("head_start"),
+        "total_ms": r.get("total_ms"), "head_start": r.get("head_start"), "stt_confidence": r.get("confidence"),
         "raw_chars": len(r["raw"]) if "raw" in r else None, "text_chars": len(r["text"]) if "text" in r else None,
         "ok": not error, "error": error[:300] or None})
 # cleanup through OpenRouter, pinned to one provider (its capacity, not our Groq free-tier limit): 178 ms median
@@ -245,6 +245,23 @@ def to_mp3(audio: bytes) -> bytes:
 STT_MODELS = {"openrouter": OPENROUTER_STT_MODEL, "cartesia": CARTESIA_STT_MODEL}  # others are set further down
 
 
+class Transcript(str):
+    """A transcript that also says how sure the transcriber was: confidence 0..1, or None when the route gives none."""
+    confidence = None
+
+
+UNCLEAR_BELOW = float(os.environ.get("UTTER_UNCLEAR_BELOW", "0.70"))
+UNCLEAR_NOTICE = "Didn't get that clearly. Please speak again."
+
+
+def unclear(raw) -> bool:
+    """Too unsure to paste: low confidence on 3 words or more. One- and two-word dictations always paste: the
+    transcriber scores very short clips low even when they are right ("Hey man." 0.50, on 60 real dictations, while
+    the one rubbish sentence scored 0.61 and every real sentence 0.77 or more, 2026-11-24)."""
+    conf = getattr(raw, "confidence", None)
+    return conf is not None and conf < UNCLEAR_BELOW and len(str(raw).split()) >= 3
+
+
 def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3", stt_model: str = "",
                stt_provider: str = "") -> str:
     """stt_model picks the OpenRouter model (a plan's choice); empty means OPENROUTER_STT_MODEL. stt_provider is the
@@ -292,7 +309,8 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
             return transcribe(mp3, language, "groq", fmt)
     elif route == "openrouter":
         o = "utter" + secrets.token_hex(8)
-        ofields = {"model": or_model, **({"language": "en"} if language != "multi" else {}),
+        ofields = {"model": or_model, "response_format": "verbose_json",  # verbose: it carries the confidence
+                   **({"language": "en"} if language != "multi" else {}),
                    **({"provider": json.dumps({"order": [stt_provider]})} if stt_provider else {})}
         obody = b"".join(f"--{o}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
                          for k, v in ofields.items())
@@ -326,7 +344,16 @@ def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3
             usd = (usage.get("seconds") or 0) * OPENROUTER_STT_USD_PER_HOUR / 3600
         cost = charge(usd, "stt")
     log_call("stt", model, route, t0, status, reply, cost_micro=cost)
-    return reply.get("text", "").strip()
+    text = Transcript(reply.get("text", "").strip())
+    if route == "openrouter":
+        if reply.get("confidence") is not None:  # AssemblyAI: one score for the whole clip
+            text.confidence = float(reply["confidence"])
+        elif reply.get("segments"):  # Whisper: its own signs of an invented transcript count as no confidence
+            segs = reply["segments"]
+            invented = any((s.get("no_speech_prob", 0) > 0.6 and s.get("avg_logprob", 0) < -1.0)
+                           or s.get("compression_ratio", 0) > 2.4 for s in segs)
+            text.confidence = 0.0 if invented else None
+    return text
 
 
 def routes_for(user: str, q: dict) -> tuple:
@@ -639,7 +666,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw = transcribe(mp3, language, stt_route, "mp3", stt_model, stt_provider)
             t1 = time.monotonic()
-            text = clean(raw, cleaner) if raw else ""
+            text = "" if unclear(raw) else clean(raw, cleaner) if raw else ""
             t2 = time.monotonic()
         except Exception as exc:
             self.log_message("dictate failed: %s", str(exc)[:200])
@@ -651,9 +678,11 @@ class Handler(BaseHTTPRequestHandler):
         stt_ms, clean_ms = (t1 - t0) * 1000, (t2 - t1) * 1000
         self.log_message("dictate: %d KB audio, stt %.0f ms, cleanup %.0f ms", length // 1024, stt_ms, clean_ms)
         result = {"text": text or raw, "raw": raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
-                  "total_ms": round(stt_ms + clean_ms)}
+                  "total_ms": round(stt_ms + clean_ms), "confidence": getattr(raw, "confidence", None)}
+        if unclear(raw):  # too unsure to paste: ask again
+            result.update(text="", error="unclear", notice=UNCLEAR_NOTICE)
         self.reply(200, result)
-        log_dictation(did, user, mp3, "mp3", language, "", stt_route, cleaner, result)
+        log_dictation(did, user, mp3, "mp3", language, "", stt_route, cleaner, result, error=result.get("error", ""))
         save_dictation(mp3, "mp3", {"user": user, "language": language, "stt": stt_route, "cleanup": cleaner, "raw": raw,
                                     "text": text or raw, "stt_ms": round(stt_ms), "cleanup_ms": round(clean_ms),
                                     "total_ms": round(stt_ms + clean_ms)})
@@ -725,6 +754,11 @@ async def finish_stream(ws, audio: bytes, language: str, stt_route: str, cleaner
             recv.cancel()
     raw = stt.result()
     t1 = time.monotonic()
+    conf = getattr(raw, "confidence", None)
+    if unclear(raw):  # nothing pasted, no cleanup paid for: the user is asked to say it again
+        return {"text": "", "raw": raw, "error": "unclear", "notice": UNCLEAR_NOTICE, "confidence": conf,
+                "stt_ms": round((t1 - t0) * 1000), "cleanup_ms": 0, "total_ms": round((t1 - t0) * 1000),
+                "head_start": False}
     head_start = bool(early and raw and same_words(raw, live_text))
     if cleaner == "none":  # transcription only: the transcript is the answer
         text, head_start = raw, False
@@ -734,7 +768,7 @@ async def finish_stream(ws, audio: bytes, language: str, stt_route: str, cleaner
         text = await asyncio.to_thread(clean, raw, cleaner, roman) if raw else ""
     t2 = time.monotonic()
     return {"text": text or raw, "raw": raw, "stt_ms": round((t1 - t0) * 1000), "cleanup_ms": round((t2 - t1) * 1000),
-            "total_ms": round((t2 - t0) * 1000), "head_start": head_start}
+            "total_ms": round((t2 - t0) * 1000), "head_start": head_start, "confidence": conf}
 
 
 async def stream_handler(ws, path=None):
@@ -841,7 +875,8 @@ async def stream_handler(ws, path=None):
                     await asyncio.to_thread(save_dictation, bytes(audio), "ogg", {**meta, "error": str(exc)[:500]})
                     return
                 accounts.record(user, accounts.audio_seconds(bytes(audio), "ogg"))
-                log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, cleaner, result)
+                log_dictation(did, user, bytes(audio), "ogg", language, script, stt_route, cleaner, result,
+                              error=result.get("error", ""))
                 print(time.strftime("%H:%M:%S"), f"stream: {len(audio) // 1024} KB opus, stt {result['stt_ms']} ms, "
                       f"cleanup {result['cleanup_ms']} ms{' (head start used)' if result['head_start'] else ''}",
                       flush=True)

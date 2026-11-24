@@ -3,8 +3,8 @@
 Updated 2026-11-24. Done items move to the bottom.
 
 ## Decisions waiting
-- [ ] **Meetings local-only:** stop saving meetings to Supabase and drop the `meetings` table (its one row is a test
-      meeting already on Arun's laptop). Notes stay only in `~/.local/share/utter/meetings/` on the user's computer.
+- [ ] **Meetings local-only:** saving to Supabase stays ON for now (Arun, 2026-11-24). Later: stop saving and drop the
+      `meetings` table, so notes stay only in `~/.local/share/utter/meetings/` on the user's computer.
 - [ ] **Saved dictations on the VPS:** turn off `UTTER_SAVE_DICTATIONS`, and decide whether to delete the ones already
       stored (permanent) or keep them.
 - [ ] **Payment provider:** Paddle, Lemon Squeezy or Stripe; set Basic $3.99 and Pro $7.99 there.
@@ -17,8 +17,8 @@ Updated 2026-11-24. Done items move to the bottom.
 - [ ] **Privacy policy and terms** (simpler once meetings and dictations are no longer stored).
 
 ## Code
-- [ ] **Rename the app:** "Utter" is too common. Shortlist: Bolo, Kaho, Sayso, Blurt, Lipi, Shabd, Typeless (check
-      domains and app-store names first). Touches the package and command names, the systemd service, the GNOME
+- [ ] **Rename the app:** "Utter" is too common. Domains checked 2026-11-24 (/data/names): every-TLD-free picks
+      bolkr, likhde, saybol (.com/.ai/.app/.io); likhdo, likhlo, kahdi, kahna (.ai/.app/.io). Check trademarks/app stores. Touches the package and command names, the systemd service, the GNOME
       shortcuts and the config folders (`~/.config/utter`, `~/.local/share/utter`), which need moving for existing users.
 - [ ] **Payment webhook** (Supabase Edge Function): the provider's events -> `apply_subscription()` (built and tested),
       plus an upgrade checkout link. Needs the provider decision.

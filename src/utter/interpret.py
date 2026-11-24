@@ -157,8 +157,10 @@ class Interpreter:
         return self.language.title() if self.language else "Chinese"
 
     def heard_language(self, language: str) -> None:
-        if language and language not in ("english", "hindi") and language != self.language:
-            self.language = language
+        # they speak Hindi or English: what you say (Hindi, Hinglish or English) goes to them in English
+        target = "english" if language in ("english", "hindi") else language
+        if target and target != self.language:
+            self.language = target
             core.LOG(f"interpret: they speak {language}; your voice goes out in {self.their_language()}")
 
     def voice_playing(self) -> bool:

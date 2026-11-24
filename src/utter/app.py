@@ -2,7 +2,7 @@
 
 Linux: run by the systemd user service `utter`; the `utter` command (bin/utter) and the hold-to-talk helper send it
 signals: SIGUSR1 starts/stops a dictation, SIGRTMIN cancels one, SIGHUP re-reads the API key, SIGUSR2 opens the window,
-SIGRTMIN+1 starts/stops meeting notes (Alt+M), SIGRTMIN+2 pauses/resumes either (Alt+X).
+SIGRTMIN+1 starts/stops meeting notes (Alt+M), SIGRTMIN+2 pauses/resumes them (Alt+P). SIGRTMIN (Alt+X, `utter cancel`) also cancels meeting notes.
 macOS / Windows: the hotkeys live in the app. One copy runs; opening the app again shows its window instead.
 `--background` (used by start at login) starts it without opening the window.
 """
@@ -129,11 +129,11 @@ def _linux_signals(app, window, core, tray) -> None:
     notifier.activated.connect(drain)
     app._signal_socks = (rsock, wsock, notifier)  # keep them alive
     signal.signal(signal.SIGUSR1, lambda *_: core.press())
-    signal.signal(signal.SIGRTMIN, lambda *_: core.cancel())
+    signal.signal(signal.SIGRTMIN, lambda *_: (core.cancel(), tray.cancel_meeting()))  # Alt+X: `utter cancel`
     signal.signal(signal.SIGHUP, lambda *_: core.reload_key())
     signal.signal(signal.SIGUSR2, lambda *_: window.open("history"))
     signal.signal(signal.SIGRTMIN + 1, lambda *_: tray.toggle_meeting())  # Alt+M: `utter meeting`
-    signal.signal(signal.SIGRTMIN + 2, lambda *_: (core.pause(), tray.pause_meeting()))  # Alt+X: `utter pause`
+    signal.signal(signal.SIGRTMIN + 2, lambda *_: tray.pause_meeting())  # Alt+P: `utter pause`
     signal.signal(signal.SIGTERM, lambda *_: app.quit())
     for kind in EARLY:
         core.press() if kind == "press" else core.cancel()

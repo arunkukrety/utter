@@ -6,12 +6,12 @@ loses at most a minute. When you stop, each track is joined into parts of up to 
 Utter server (mode=meeting: ElevenLabs Scribe through the Surplus key market, with speaker labels on the others' track),
 the lines are merged by their real timestamps, and the server writes notes from that (mode=notes). Transcript and notes
 are saved as Markdown in DATA/meetings/<when>/ and the notes are copied to the clipboard; the audio is deleted once the
-notes exist. Alt+X pauses and resumes: each stretch of recording is its own "part" (p0, p1, ...) with its start time, so
+notes exist. Pausing (Alt+P, the pill's button or the tray) ends a "part"; each stretch of recording is its own "part" (p0, p1, ...) with its start time, so
 the transcript's clock stays right across pauses. The server allows this only on plans with meeting notes (Pro) and for the owner key.
 
 Headphones work best: on speakers your mic also hears the others, and their words then show up under "You" too.
 """
-import asyncio, glob, json, os, re, subprocess, threading, time
+import asyncio, glob, json, os, re, shutil, subprocess, threading, time
 
 import websockets
 
@@ -83,7 +83,7 @@ class Meeting:
         self.procs = []
 
     def pause(self) -> None:
-        """Alt+X: pause or resume the recording."""
+        """Alt+P, the pill's pause button or the tray: pause or resume the recording."""
         if not self.recording:
             return
         if self.paused:
@@ -95,6 +95,17 @@ class Meeting:
             self.paused = True
             self.on_state("paused")
         core.LOG(f"meeting: {'paused' if self.paused else 'resumed'}")
+
+    def cancel(self) -> None:
+        """Alt+X: stop and throw the recording away, no notes."""
+        if not self.recording:
+            return
+        self._end_part()
+        self.paused = False
+        shutil.rmtree(self.dir, ignore_errors=True)
+        core.LOG("meeting: cancelled, recording deleted")
+        core.notify("Meeting notes cancelled.")
+        self.on_state("done")
 
     def stop(self) -> None:
         """Stop recording and write the notes in the background."""

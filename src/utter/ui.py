@@ -54,7 +54,7 @@ class Pill(QWidget):
         self.font_.setPixelSize(13)
         self.note = ""
         self.history, self.bars = [], [0.0] * BARS
-        self.start, self.closing, self.processing, self.message, self.paused = 0.0, None, None, False, False
+        self.start, self.closing, self.processing, self.message = 0.0, None, None, False
         self.timer = QTimer(self, interval=16, timeout=self.tick)  # ~60 fps, only while visible
         self.message_timer = QTimer(self, singleShot=True, timeout=self.end_message)
         self.line.connect(self.handle)  # emitted from the engine's thread, run on this one
@@ -79,12 +79,7 @@ class Pill(QWidget):
         r = self.height() / 2
         p.drawRoundedRect(QRectF(self.rect()), r, r)
         p.translate(PAD_X, PAD_Y)
-        if self.paused:  # Alt+X: grey dot and a pause sign
-            self.dot(p, QColor(161, 161, 171, 230))
-            p.setBrush(QColor(245, 245, 245, 230))
-            for x in (24, 31):
-                p.drawRoundedRect(QRectF(x, 4, 3.5, 14), 1.5, 1.5)
-        elif self.message:  # a short notice ("Didn't catch that"): a calm grey dot beside the text
+        if self.message:  # a short notice ("Didn't catch that"): a calm grey dot beside the text
             self.dot(p, QColor(161, 161, 171, 230))
         elif self.processing is not None:  # waiting for the final text: grey dot and three dots rising in a wave
             self.dot(p, QColor(161, 161, 171, 230))
@@ -133,7 +128,7 @@ class Pill(QWidget):
 
     def show_pill(self) -> None:
         self.history, self.bars = [], [0.0] * BARS
-        self.start, self.closing, self.processing, self.message, self.paused = time.monotonic(), None, None, False, False
+        self.start, self.closing, self.processing, self.message = time.monotonic(), None, None, False
         self.note = ""
         self.fit()
         self.setWindowOpacity(0)
@@ -164,13 +159,9 @@ class Pill(QWidget):
             if self.visible() and self.closing is None:
                 self.processing = time.monotonic()
                 self.set_note("Reconnecting…")
-        elif line == "A":  # reconnected, or resumed: back to the listening bars
-            self.processing, self.paused = None, False
+        elif line == "A":  # reconnected: back to the listening bars
+            self.processing = None
             self.set_note("")
-        elif line == "Z":  # paused (Alt+X)
-            if self.visible() and self.closing is None:
-                self.processing, self.paused = None, True
-                self.set_note("Paused · Alt+X to resume")
         elif line == "P":  # stopped listening, waiting for the final text
             if self.visible() and self.closing is None:
                 self.processing = time.monotonic()
@@ -186,13 +177,14 @@ class Pill(QWidget):
 
 # ---- the meeting pill -----------------------------------------------------------------------------------------------
 GLOW = 5  # room around the pill for the border's glow
+BUTTON = 22  # the meeting pill's pause button
 SHINE = [(0.0, "#a78bfa"), (0.33, "#22d3ee"), (0.66, "#f472b6"), (1.0, "#a78bfa")]  # violet, cyan, pink
 
 
 class MeetingPill(QWidget):
     """Shown for the whole of a meeting recording, just above where the dictation pill appears. It rises and fades in
     like the dictation pill, with a turning violet-cyan-pink border whose glow breathes, a pulsing red dot and the time
-    recorded so far. Paused (Alt+X), the border fades to grey and stops; after the stop the border speeds up while
+    recorded so far, and a round pause/resume button on the right. Paused, the border fades to grey and stops; after the stop the border speeds up while
     three dots ripple beside "Writing meeting notes", then it sinks and fades out."""
     state = Signal(str)  # "rec", "paused", "resumed", "writing", "done": from the meeting's thread, run on this one
 
@@ -212,10 +204,30 @@ class MeetingPill(QWidget):
         self.grey = 0.0  # 0 = full colour, 1 = paused grey; eased toward its goal each frame
         self.timer = QTimer(self, interval=16, timeout=self.tick)  # ~60 fps, only while shown
         self.state.connect(self.on_state)
+        self.on_pause = lambda: None  # set by the tray: pause or resume the meeting
+        self.on_change = lambda state: None  # set by the tray: its icon and menu follow, on this (the UI) thread
+        self.hover = False
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
         fm = QFontMetrics(self.font_)
         self.resize(GLOW * 2 + PAD_X * 2 + 30 + GAP + max(fm.horizontalAdvance(t) for t in (
-            "Meeting notes · 0:00:00", "Writing meeting notes", "Paused · 0:00:00 · Alt+X")),
+            "Meeting notes · 0:00:00", "Writing meeting notes", "Paused · 0:00:00")) + BUTTON + GAP,
             GLOW * 2 + METER_H + PAD_Y * 2)
+
+    def button(self) -> QRectF:
+        box = QRectF(self.rect()).adjusted(GLOW, GLOW, -GLOW, -GLOW)
+        return QRectF(box.right() - PAD_X + 4 - BUTTON, box.center().y() - BUTTON / 2, BUTTON, BUTTON)
+
+    def mouseMoveEvent(self, event) -> None:
+        self.hover = self.button().adjusted(-4, -4, 4, 4).contains(event.position())
+
+    def leaveEvent(self, _event) -> None:
+        self.hover = False
+
+    def mousePressEvent(self, event) -> None:
+        if self.mode != "writing" and self.closing is None and \
+                self.button().adjusted(-4, -4, 4, 4).contains(event.position()):
+            self.on_pause()
 
     def on_state(self, state: str) -> None:
         now = time.monotonic()
@@ -239,6 +251,7 @@ class MeetingPill(QWidget):
         else:  # done: sink and fade out
             self.closing = now
         self.changed = now
+        self.on_change(state)
         self.tick()
 
     def elapsed(self) -> int:
@@ -259,7 +272,7 @@ class MeetingPill(QWidget):
         self.grey += ((1.0 if self.mode == "paused" else 0.0) - self.grey) * min(1.0, dt * 8)
         s = self.elapsed()
         clock = f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
-        self.text = {"rec": f"Meeting notes · {clock}", "paused": f"Paused · {clock} · Alt+X",
+        self.text = {"rec": f"Meeting notes · {clock}", "paused": f"Paused · {clock}",
                      "writing": "Writing meeting notes"}[self.mode]
         if self.closing is None:
             t = min(1.0, (now - self.shown_at) * 1000 / IN_MS)
@@ -323,6 +336,18 @@ class MeetingPill(QWidget):
         p.setPen(QColor(244, 244, 245, int(255 * min(1.0, 0.3 + since * 4))))  # new text fades in on a mode change
         p.setFont(self.font_)
         p.drawText(box.adjusted(PAD_X + 30 + GAP - 10, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self.text)
+        if self.mode != "writing":  # the pause/resume button: a soft disc that brightens under the pointer
+            b = self.button()
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 46 if self.hover else 22))
+            p.drawEllipse(b)
+            p.setBrush(QColor(244, 244, 245))
+            c = b.center()
+            if self.mode == "paused":  # a play triangle: resume
+                p.drawPolygon([QPointF(c.x() - 3, c.y() - 5), QPointF(c.x() + 5, c.y()), QPointF(c.x() - 3, c.y() + 5)])
+            else:
+                for dx in (-3.5, 1):
+                    p.drawRoundedRect(QRectF(c.x() + dx, c.y() - 5, 2.5, 10), 1, 1)
 
 
 # ---- settings and keys on disk --------------------------------------------------------------------------------------
@@ -827,13 +852,31 @@ def make_tray(window: Window) -> QSystemTrayIcon:
         pill = MeetingPill()
         MEETING.on_state = pill.state.emit  # the pill follows the recording, from whichever thread reports it
 
+        pause = QAction("Pause meeting notes  (Alt+P)", menu)
+        pause.setVisible(False)
+        icons = {s: QIcon(plat.resource("data", f"utter-tray{s}.svg")) for s in ("", "-meeting", "-paused")}
+
         def on_meeting() -> None:  # the menu item and Alt+M (`utter meeting`) both land here
-            meeting.setText("Stop meeting notes  (Alt+M)" if MEETING.toggle() else "Start meeting notes  (Alt+M)")
+            MEETING.toggle()
+
+        def follow(state: str) -> None:  # the menu and the icon follow the meeting (on the UI thread, via the pill)
+            on = state in ("rec", "paused", "resumed")
+            meeting.setText("Stop meeting notes  (Alt+M)" if on else "Start meeting notes  (Alt+M)")
+            pause.setVisible(on)
+            pause.setText(("Resume" if state == "paused" else "Pause") + " meeting notes  (Alt+P)")
+            tray.setIcon(icons["-paused" if state == "paused" else "-meeting" if on else ""])
+            tray.setToolTip("Utter: meeting paused" if state == "paused" else
+                            "Utter: recording meeting notes" if on else "Utter")
 
         meeting.setText("Start meeting notes  (Alt+M)")
         meeting.triggered.connect(on_meeting)
+        pause.triggered.connect(MEETING.pause)
+        pill.on_pause = MEETING.pause
+        pill.on_change = follow
         menu.insertAction(menu.actions()[3], meeting)  # above Settings' separator, with the other actions
-        tray.toggle_meeting, tray.pause_meeting, tray._meeting_pill = on_meeting, MEETING.pause, pill
+        menu.insertAction(menu.actions()[4], pause)
+        tray.toggle_meeting, tray.cancel_meeting, tray.pause_meeting = on_meeting, MEETING.cancel, MEETING.pause
+        tray._meeting_pill = pill
     tray.setContextMenu(menu)
     if sys.platform == "win32":  # a left click on Windows opens the window; the menu is on the right click
         tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger and window.open("history"))

@@ -51,4 +51,5 @@ Updated 2026-11-24. Done items move to the bottom.
   the meeting pill.
 - App 1.0.8–1.0.11: short dictations no longer dropped, clear error messages, other audio fades down while dictating.
 - App 1.0.12: the meeting pill animates (rises in, breathing glow, red-dot ripple, grey when paused, dots while
-  writing, sinks out); Alt+X pauses and resumes a dictation or meeting; notes are copied, no longer opened in an editor.
+  writing, sinks out) and has a pause button; Alt+P pauses/resumes a meeting, Alt+X cancels a dictation or meeting;
+  the tray icon changes while a meeting is on or paused; notes are copied, no longer opened in an editor.

@@ -15,7 +15,8 @@ a = Analysis(
     [here("packaging", "utter-app.py")],
     pathex=[here("src")],
     datas=[(here("sounds", "start.wav"), "sounds"), (here("sounds", "stop.wav"), "sounds"),
-           (here("data", "utter.svg"), "data"), (here("data", "utter-tray.svg"), "data")],
+           (here("data", "utter.svg"), "data"), (here("data", "utter-tray.svg"), "data"),
+           (here("data", "utter-tray-meeting.svg"), "data"), (here("data", "utter-tray-paused.svg"), "data")],
     # the platform modules are picked at run time; name this platform's so it is always collected
     hiddenimports=["utter.plat.linux" if LINUX else "utter.plat.mac" if MAC else "utter.plat.windows"],
     # Linux uses the system's ffmpeg (a .deb dependency), so the 165 MB bundled one stays out

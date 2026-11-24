@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # utter            start or stop a dictation (bind this to a keyboard shortcut)
 # utter meeting    start or stop meeting notes (Alt+M)
-# utter pause      pause or resume a dictation or meeting notes (Alt+X)
+# utter pause      pause or resume meeting notes (Alt+P)
+# utter cancel     stop a dictation or meeting notes and throw it away (Alt+X)
 # utter settings   open the window: history, API key, typing mode, microphone
 # utter quit       stop Utter (the next `utter` starts it again)
 set -euo pipefail
@@ -9,10 +10,11 @@ svc=utter
 case "${1:-toggle}" in
   toggle) sig=USR1 ;;
   meeting) sig=RTMIN+1 ;;  # start or stop meeting notes (Alt+M)
-  pause) sig=RTMIN+2 ;;  # pause or resume (Alt+X)
+  pause) sig=RTMIN+2 ;;  # pause or resume meeting notes (Alt+P)
+  cancel) sig=RTMIN ;;  # cancel a dictation or meeting notes: nothing pasted, no notes (Alt+X)
   settings|history|open) sig=USR2 ;;
   quit|stop) exec systemctl --user stop "$svc" ;;
-  -h|--help|help) sed -n '2,6p' "$0" | sed 's/^# //'; exit 0 ;;
+  -h|--help|help) sed -n '2,7p' "$0" | sed 's/^# //'; exit 0 ;;
   *) echo "utter: unknown command '$1' (try: utter --help)" >&2; exit 2 ;;
 esac
 if ! systemctl --user is-active --quiet "$svc"; then

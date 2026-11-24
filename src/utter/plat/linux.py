@@ -247,8 +247,10 @@ def _is_utter(command: str) -> bool:
 # the extra shortcuts, each bound once per user on GNOME: (setting, key, `utter` argument, name, first-run notice)
 EXTRA_KEYS = [("meeting_hotkey_checked", "<Alt>m", "meeting", "Utter: start or stop meeting notes",
                "Press Alt+M to start meeting notes, and again to stop."),
-              ("pause_hotkey_checked", "<Alt>x", "pause", "Utter: pause or resume",
-               "Press Alt+X to pause a dictation or meeting notes, and again to resume.")]
+              ("pause_hotkey_checked", "<Alt>p", "pause", "Utter: pause or resume meeting notes",
+               "Press Alt+P to pause meeting notes, and again to resume."),
+              ("cancel_hotkey_checked", "<Alt>x", "cancel", "Utter: cancel dictation or meeting notes",
+               "Press Alt+X to cancel a dictation or meeting notes.")]
 
 
 def _bind_extra_keys() -> None:
@@ -321,7 +323,7 @@ def set_shortcut(combo: str) -> str:
 def start_keys(on_press, on_cancel) -> None:
     """Presses arrive as signals (wired in __main__). First run on GNOME: bind Alt+D to `utter`, unless Utter already
     has a shortcut or Alt+D is taken. Runs once per user; change it later in Settings. Alt+M (meeting notes) and Alt+X
-    (pause) likewise."""
+    (cancel) likewise."""
     try:
         _bind_extra_keys()
     except (OSError, ValueError, SyntaxError, subprocess.TimeoutExpired) as exc:

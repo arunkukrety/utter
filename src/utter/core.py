@@ -324,7 +324,7 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
         popup.message("Add your Utter key in Settings to start dictating.")
         popup.open("settings")
         return
-    DICTATION.update(running=True, cancelled=False, paused=False)
+    DICTATION.update(running=True, cancelled=False)
     # other audio (music, a video, a call) is turned down while you talk, and back up the moment recording stops
     ducker = None  # glides other audio down now and back up on release(), on its own thread: nothing here waits for it
     if setting("duck_media") is not False and hasattr(plat, "Ducker"):
@@ -332,22 +332,6 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
         ducker = plat.Ducker(level)
     rec = await plat.open_mic(setting("mic"))
     popup.begin()
-
-    def on_pause() -> None:  # Alt+X: the mic stays open but nothing is sent, and other audio comes back up
-        nonlocal ducker
-        DICTATION["paused"] = not DICTATION["paused"]
-        if DICTATION["paused"]:
-            restore_audio()
-            ducker = None
-            popup._send("Z")
-        else:
-            if setting("duck_media") is not False and hasattr(plat, "Ducker"):
-                level = (setting("duck_level") if isinstance(setting("duck_level"), (int, float)) else DUCK_LEVEL) / 100
-                ducker = plat.Ducker(level)
-            popup._send("A")
-        LOG("dictation " + ("paused" if DICTATION["paused"] else "resumed"))
-
-    DICTATION["on_pause"] = on_pause
     roman = setting("hindi") != "devanagari"  # Hindi as Roman Hinglish unless Settings says Devanagari
     text = raw = None
     mic_off = asyncio.Event()
@@ -366,8 +350,6 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
                 continue
             if data is None:
                 break
-            if DICTATION["paused"]:
-                continue
             server.feed(data)
             n += 1
             audio_chunks["n"] = n
@@ -405,7 +387,7 @@ async def dictate(stop: asyncio.Event, pressed_at: float) -> None:
         cancelled = DICTATION["cancelled"]
         if cancelled:
             text = raw = None  # nothing pasted, nothing saved
-        DICTATION.update(running=False, paused=False, on_pause=None)
+        DICTATION["running"] = False
         if text:
             popup.hide()
         elif cancelled:
@@ -448,10 +430,6 @@ def cancel() -> None:
     _call("cancel")
 
 
-def pause() -> None:
-    _call("pause")
-
-
 def reload_key() -> None:
     """A new key, language or script was saved: reconnect with it before the next press."""
     if LOOP is not None and WARM_NOW is not None:
@@ -476,18 +454,14 @@ async def main() -> None:
         presses["n"] += 1
         toggle.set()
 
-    def on_cancel() -> None:  # hold-to-talk: the hold key + another key after recording began
+    def on_cancel() -> None:  # Alt+X (`utter cancel`), or on hold-to-talk another key while the hold key is down
         if DICTATION["running"] and not DICTATION["cancelled"]:
             DICTATION["cancelled"] = True
-            LOG(f"cancelled by another key while {plat.HOLD_KEY} was held")
+            LOG("dictation cancelled")
             on_press()  # stop it; nothing is pasted
 
     WARM_NOW = asyncio.Event()
-    def on_pause() -> None:
-        if DICTATION.get("running") and DICTATION.get("on_pause"):
-            DICTATION["on_pause"]()
-
-    HANDLERS.update(press=on_press, cancel=on_cancel, pause=on_pause)
+    HANDLERS.update(press=on_press, cancel=on_cancel)
     with EARLY_LOCK:
         LOOP = asyncio.get_running_loop()
         for kind in EARLY:  # presses that arrived while it was still starting

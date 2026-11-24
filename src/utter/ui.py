@@ -384,7 +384,7 @@ class Subtitles(QWidget):
     """What the interpreter heard, near the bottom of the screen: their words in their language (small, grey) with the
     English under it (large, white); your own lines smaller, in violet. The last two lines stay; the bar fades out
     after a quiet spell and never takes a click (the pointer goes through it)."""
-    line = Signal(str, str, str)  # lane, what was heard, the English ("" when it was already English)
+    line = Signal(str, str, str, bool)  # lane, what was heard, the English ("" if already English), still being said
     STAY_S, FADE_S, KEEP = 8.0, 0.6, 2
 
     def __init__(self) -> None:
@@ -404,15 +404,20 @@ class Subtitles(QWidget):
 
     def rows(self, e) -> list:
         """[(font, colour, text)] for one entry."""
-        lane, heard, english = e
+        lane, heard, english, _draft = e
         if lane == "me":
             return [(self.small, QColor("#c4b5fd"), "You: " + (english or heard))]
         if english:
             return [(self.small, QColor(161, 161, 171), heard), (self.big, QColor("#f4f4f5"), english)]
         return [(self.big, QColor("#f4f4f5"), heard)]
 
-    def add(self, lane: str, heard: str, english: str) -> None:
-        self.entries = (self.entries + [(lane, heard, english)])[-self.KEEP:]
+    def add(self, lane: str, heard: str, english: str, draft: bool) -> None:
+        # a lane's draft is replaced by its next draft or by the sentence's final words, which then stay
+        self.entries = [e for e in self.entries if not (e[0] == lane and e[3])]
+        if heard:
+            self.entries = (self.entries + [(lane, heard, english, draft)])[-self.KEEP:]
+        if not self.entries:
+            return self.clear()
         self.last = time.monotonic()
         area = QGuiApplication.primaryScreen().availableGeometry()
         w = min(820, int(area.width() * 0.7))

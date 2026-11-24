@@ -22,6 +22,7 @@ START_FRAMES, END_FRAMES, MAX_FRAMES = 3, 30, 500  # speech starts after 60 ms, 
 PRE_ROLL = 15  # 0.3 s kept from before the start, so the first syllable is not clipped
 MIN_SPEECH = 15  # under 0.3 s of speech is a click or a cough: not sent
 QUIET_AFTER_S = 0.3  # listening resumes this long after a translated voice stops
+PEEK_FRAMES = 40  # while a sentence is still being said, its words so far are shown every 0.8 s
 
 
 def _pactl(*args) -> str:
@@ -44,6 +45,17 @@ def cleanup() -> None:
         pass
 
 
+def _ogg(pcm: bytes) -> bytes:
+    return subprocess.run([core.FFMPEG, "-v", "error", "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",
+                           "-c:a", "libopus", "-b:a", "24k", "-f", "ogg", "pipe:1"], input=pcm, capture_output=True).stdout
+
+
+def _connect():
+    return websockets.sync.client.connect((core.setting("server_url") or core.SERVER_URL) + "?mode=interpret",
+                                          additional_headers={"Authorization": f"Bearer {core.read_token()}"},
+                                          max_size=None, open_timeout=10)
+
+
 def _level(chunk: bytes) -> float:
     samples = array.array("h", chunk)
     return math.sqrt(sum(x * x for x in samples) / max(1, len(samples)))
@@ -54,13 +66,14 @@ class Lane:
 
     def __init__(self, session, name: str, device: str, play_to) -> None:
         self.session, self.name, self.device, self.play_to = session, name, device, play_to
-        self.sentences, self.voices = queue.Queue(), queue.Queue()
+        self.sentences, self.voices, self.peeks = queue.Queue(), queue.Queue(), queue.Queue()
         self.proc = None
+        self.seq, self.done = 0, 0  # the sentence being said, and the last one whose final words are shown
 
     def start(self) -> None:
         self.proc = subprocess.Popen(["parecord", "--raw", "--rate=16000", "--channels=1", "--format=s16le",
                                       f"--device={self.device}"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        for target in (self._listen, self._send, self._play):
+        for target in (self._listen, self._send, self._play, self._peek):
             threading.Thread(target=target, name=f"interpret-{self.name}", daemon=True).start()
 
     def stop(self) -> None:
@@ -68,6 +81,7 @@ class Lane:
             self.proc.terminate()
         self.sentences.put(None)
         self.voices.put(None)
+        self.peeks.put(None)
 
     def _listen(self) -> None:
         """Cut sentences by loudness: the room's own noise is tracked slowly, speech is clearly above it."""
@@ -84,29 +98,60 @@ class Lane:
                 loud_run = loud_run + 1 if loud else 0
                 if loud_run >= START_FRAMES:
                     current, speech, quiet = list(before), loud_run, 0
+                    self.seq += 1
                 continue
             current.append(chunk)
             speech += loud
             quiet = 0 if loud else quiet + 1
             if quiet >= END_FRAMES or len(current) >= MAX_FRAMES:
                 if speech >= MIN_SPEECH:
-                    self.sentences.put(b"".join(current))
+                    self.sentences.put((self.seq, b"".join(current)))
                 before, current, speech, quiet, loud_run = [], [], 0, 0, 0
+            elif len(current) % PEEK_FRAMES == 0 and speech >= MIN_SPEECH and quiet < 10:
+                self.peeks.put((self.seq, b"".join(current)))
+
+    def _peek(self) -> None:
+        """The live subtitle: the sentence so far, on a connection of its own so the final words never wait for it.
+        Only the newest snapshot is sent; one that is overtaken by its sentence's final words is dropped."""
+        ws = None
+        while (item := self.peeks.get()) is not None:
+            while not self.peeks.empty():
+                if (newer := self.peeks.get_nowait()) is None:
+                    return ws and ws.close()
+                item = newer
+            seq, pcm = item
+            if seq <= self.done:
+                continue
+            try:
+                ws = ws or _connect()
+                to = "English" if self.name == "them" else self.session.their_language()
+                ws.send(json.dumps({"to": to, "lane": self.name}))
+                ws.send(_ogg(pcm))
+                ws.send("peek")
+                reply = json.loads(ws.recv(timeout=10))
+            except Exception as exc:
+                core.LOG(f"interpret {self.name} peek: {type(exc).__name__} {str(exc)[:100]}")
+                try:
+                    ws and ws.close()
+                except Exception:
+                    pass
+                ws = None
+                continue
+            if reply.get("heard") and seq > self.done:
+                self.session.on_line(self.name, reply["heard"], "" if reply.get("same") else reply["text"], True)
+        if ws is not None:
+            ws.close()
 
     def _send(self) -> None:
         """One connection for the whole session; sentences go one at a time, in order."""
         ws = None
-        while (pcm := self.sentences.get()) is not None:
-            ogg = subprocess.run([core.FFMPEG, "-v", "error", "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0",
-                                  "-c:a", "libopus", "-b:a", "24k", "-f", "ogg", "pipe:1"],
-                                 input=pcm, capture_output=True).stdout
+        while (item := self.sentences.get()) is not None:
+            seq, pcm = item
+            ogg = _ogg(pcm)
             for attempt in (1, 2):
                 try:
                     if ws is None:
-                        ws = websockets.sync.client.connect(
-                            (core.setting("server_url") or core.SERVER_URL) + "?mode=interpret",
-                            additional_headers={"Authorization": f"Bearer {core.read_token()}"}, max_size=None,
-                            open_timeout=10)
+                        ws = _connect()
                     to = "English" if self.name == "them" else self.session.their_language()
                     ws.send(json.dumps({"to": to, "lane": self.name}))
                     ws.send(ogg)
@@ -125,11 +170,14 @@ class Lane:
                 core.notify(reply["notice"])
                 self.session.stop()
                 return
+            self.done = seq
             if reply.get("heard"):
                 core.LOG(f"interpret {self.name} ({reply.get('language')}): {reply['heard']} -> {reply['text']}")
                 if self.name == "them":
                     self.session.heard_language(reply.get("language", ""))
-                self.session.on_line(self.name, reply["heard"], "" if reply.get("same") else reply["text"])
+                self.session.on_line(self.name, reply["heard"], "" if reply.get("same") else reply["text"], False)
+            else:  # nothing worth showing after all: the live draft goes
+                self.session.on_line(self.name, "", "", False)
             if pcm_out:
                 self.voices.put((pcm_out, reply.get("rate", 24000)))
             elif reply.get("same") and self.name == "me":  # already in their language: they hear you, as you said it
@@ -160,7 +208,8 @@ class Interpreter:
         self.voices, self.quiet_until, self.ducker = 0, 0.0, None
         self.lock = threading.Lock()
         self.on_state = lambda on: None  # told True/False when it starts or stops; may be called from any thread
-        self.on_line = lambda lane, heard, english: None  # each sentence, for the subtitles; english "" if no change
+        # each sentence, for the subtitles (english "" if no change); draft=True while it is still being said
+        self.on_line = lambda lane, heard, english, draft: None
 
     def their_language(self) -> str:
         return self.language.title() if self.language else "Chinese"

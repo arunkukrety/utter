@@ -691,6 +691,16 @@ def speak(text: str, lane: str) -> bytes:
 FILLERS = {"you", "uh", "um", "uh-huh", "mm", "mhm", "hmm", "ah", "oh", "thank you", "thanks for watching", "bye"}
 
 
+def peek(ogg: bytes, to: str) -> dict:
+    """The sentence so far, while it is still being said: its words and their translation, nothing spoken."""
+    heard, language = hear(ogg)
+    if not heard or re.sub(r"[^\w\s'-]", "", heard).strip().lower() in FILLERS:
+        return {"heard": "", "text": ""}
+    if language == to.lower():
+        return {"heard": heard, "text": heard, "same": True}
+    return {"heard": heard, "text": translate(heard, to)}
+
+
 def interpret(ogg: bytes, to: str, lane: str) -> tuple:
     """-> (reply for the app, the translated voice as PCM or b""). Already in the language wanted ("same"): nothing is
     translated or spoken; the app shows it and, for your own voice, sends your words as you said them."""
@@ -898,6 +908,16 @@ async def stream_handler(ws, path=None):
                     if len(audio) > MAX_AUDIO:
                         await ws.close(code=4413, reason="too much audio")
                         return
+                elif msg == "peek":  # a live preview of the sentence so far: text only, not counted as audio used
+                    try:
+                        if accounts.blocked(user) or accounts.over_limit(user):
+                            raise RuntimeError("not allowed")  # the next "end" tells them why
+                        reply = await asyncio.to_thread(peek, bytes(audio), to)
+                    except Exception as exc:
+                        print(time.strftime("%H:%M:%S"), "peek failed:", str(exc)[:200], flush=True)
+                        reply = {"error": "peek failed"}
+                    audio = bytearray()
+                    await ws.send(json.dumps(reply))
                 elif msg == "end":
                     notice = accounts.blocked(user) or accounts.over_limit(user)
                     if notice:

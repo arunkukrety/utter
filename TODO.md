@@ -32,6 +32,14 @@ Updated 2026-11-24. Done items move to the bottom.
 - [ ] Retention for saved dictations — only if saving stays on.
 
 ## Later
+- [ ] **Real-time meeting translator** (Arun, 2026-11-24): in a call where someone speaks, say, Chinese, you hear them
+      in your language, and they hear you in theirs. Two live pipelines, each speech -> text -> translate -> speech:
+      - Theirs -> you: the call's audio (the same monitor source meeting notes record) is transcribed in chunks,
+        translated, spoken back to you over the call's sound turned down (the volume fade already exists).
+      - You -> them: your mic, translated and spoken into a virtual mic (a PipeWire null sink + its monitor as a
+        source) that you pick as the microphone in Zoom/Meet/Teams.
+      - The hard part is delay: aim for ~1-2 s, so streaming STT plus sentence-sized chunks, a fast translation model
+        and a streaming TTS voice; check speech-to-speech models too, which skip the text step. Linux first.
 - [ ] Mac and Windows: meeting capture (ScreenCaptureKit / WASAPI loopback) and the volume fades.
 - [ ] Keyterms for meetings (names like "SKD"), about $0.01/hour through Surplus.
 - [ ] Per-app audio capture for meetings, so notification sounds and other apps stay out.

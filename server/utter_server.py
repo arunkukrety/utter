@@ -687,12 +687,19 @@ def speak(text: str, lane: str) -> bytes:
     return data
 
 
+# what Whisper writes for a breath, a cough or background music: never worth saying out loud (2026-11-24, Discord test)
+FILLERS = {"you", "uh", "um", "uh-huh", "mm", "mhm", "hmm", "ah", "oh", "thank you", "thanks for watching", "bye"}
+
+
 def interpret(ogg: bytes, to: str, lane: str) -> tuple:
-    """-> (reply for the app, the translated voice as PCM or b"")."""
+    """-> (reply for the app, the translated voice as PCM or b""). Already in the language wanted ("same"): nothing is
+    translated or spoken; the app shows it and, for your own voice, sends your words as you said them."""
     t = time.monotonic()
     heard, language = hear(ogg)
-    if not heard:
+    if not heard or re.sub(r"[^\w\s'-]", "", heard).strip().lower() in FILLERS:
         return {"heard": "", "language": "", "text": ""}, b""
+    if language == to.lower():
+        return {"heard": heard, "language": language, "text": heard, "same": True}, b""
     t_stt = time.monotonic()
     text = translate(heard, to)
     t_tr = time.monotonic()

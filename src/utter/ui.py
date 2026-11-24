@@ -379,6 +379,84 @@ class MeetingPill(QWidget):
                     p.drawRoundedRect(QRectF(c.x() + dx, c.y() - 5, 2.5, 10), 1, 1)
 
 
+# ---- the interpreter's subtitles ------------------------------------------------------------------------------------
+class Subtitles(QWidget):
+    """What the interpreter heard, near the bottom of the screen: their words in their language (small, grey) with the
+    English under it (large, white); your own lines smaller, in violet. The last two lines stay; the bar fades out
+    after a quiet spell and never takes a click (the pointer goes through it)."""
+    line = Signal(str, str, str)  # lane, what was heard, the English ("" when it was already English)
+    STAY_S, FADE_S, KEEP = 8.0, 0.6, 2
+
+    def __init__(self) -> None:
+        flags = (Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
+                 | Qt.WindowTransparentForInput)
+        if sys.platform.startswith("linux"):
+            flags |= Qt.X11BypassWindowManagerHint
+        super().__init__(None, flags)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.small, self.big = QFont(), QFont()
+        self.small.setPixelSize(13)
+        self.big.setPixelSize(18)
+        self.entries, self.last = [], 0.0
+        self.timer = QTimer(self, interval=33, timeout=self.tick)
+        self.line.connect(self.add)
+
+    def rows(self, e) -> list:
+        """[(font, colour, text)] for one entry."""
+        lane, heard, english = e
+        if lane == "me":
+            return [(self.small, QColor("#c4b5fd"), "You: " + (english or heard))]
+        if english:
+            return [(self.small, QColor(161, 161, 171), heard), (self.big, QColor("#f4f4f5"), english)]
+        return [(self.big, QColor("#f4f4f5"), heard)]
+
+    def add(self, lane: str, heard: str, english: str) -> None:
+        self.entries = (self.entries + [(lane, heard, english)])[-self.KEEP:]
+        self.last = time.monotonic()
+        area = QGuiApplication.primaryScreen().availableGeometry()
+        w = min(820, int(area.width() * 0.7))
+        h = 24 + sum(QFontMetrics(f).boundingRect(0, 0, w - 40, 2000, Qt.TextWordWrap, t).height() + 4
+                     for e in self.entries for f, _c, t in self.rows(e)) + 8 * (len(self.entries) - 1)
+        self.resize(w, h)
+        self.move(area.x() + (area.width() - w) // 2, area.y() + area.height() - BOTTOM_GAP - 110 - h)
+        self.setWindowOpacity(1.0)
+        self.show()
+        self.timer.start()
+        self.update()
+
+    def tick(self) -> None:
+        quiet = time.monotonic() - self.last - self.STAY_S
+        if quiet > 0:
+            self.setWindowOpacity(max(0.0, 1 - quiet / self.FADE_S))
+            if quiet >= self.FADE_S:
+                self.timer.stop()
+                self.hide()
+                self.entries = []
+
+    def clear(self) -> None:
+        self.timer.stop()
+        self.hide()
+        self.entries = []
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(24, 24, 27, 225))
+        p.drawRoundedRect(QRectF(self.rect()), 14, 14)
+        y = 12
+        for i, e in enumerate(self.entries):
+            if i:
+                y += 8
+            for font, colour, text in self.rows(e):
+                p.setFont(font)
+                p.setPen(colour)
+                r = QFontMetrics(font).boundingRect(0, 0, self.width() - 40, 2000, Qt.TextWordWrap, text)
+                p.drawText(QRectF(20, y, self.width() - 40, r.height()), Qt.TextWordWrap | Qt.AlignHCenter, text)
+                y += r.height() + 4
+
+
 # ---- settings and keys on disk --------------------------------------------------------------------------------------
 def read_settings() -> dict:
     try:
@@ -979,10 +1057,13 @@ def make_tray(window: Window) -> QSystemTrayIcon:
         interpreter = QAction("Start interpreter  (Alt+I)", menu)
         relay = Relay(menu)
         relay.fired.connect(lambda on: interpreter.setText(("Stop" if on else "Start") + " interpreter  (Alt+I)"))
+        subtitles = Subtitles()
+        INTERPRETER.on_line = subtitles.line.emit  # from the lanes' threads, shown on this one
+        relay.fired.connect(lambda on: None if on else subtitles.clear())
         INTERPRETER.on_state = relay.fired.emit
         interpreter.triggered.connect(INTERPRETER.toggle)
         menu.insertAction(menu.actions()[6], interpreter)
-        tray._relay = relay
+        tray._relay, tray._subtitles = relay, subtitles
         tray.toggle_interpreter = INTERPRETER.toggle
         tray.toggle_meeting, tray.cancel_meeting, tray.pause_meeting = on_meeting, MEETING.cancel, MEETING.pause
         tray._meeting_pill = pill

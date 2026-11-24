@@ -129,20 +129,28 @@ class Lane:
                 core.LOG(f"interpret {self.name} ({reply.get('language')}): {reply['heard']} -> {reply['text']}")
                 if self.name == "them":
                     self.session.heard_language(reply.get("language", ""))
+                self.session.on_line(self.name, reply["heard"], "" if reply.get("same") else reply["text"])
             if pcm_out:
                 self.voices.put((pcm_out, reply.get("rate", 24000)))
+            elif reply.get("same") and self.name == "me":  # already in their language: they hear you, as you said it
+                self.voices.put((pcm, 16000))
         if ws is not None:
             ws.close()
 
     def _play(self) -> None:
+        # only a voice played to you, out loud, pauses listening: yours goes into the virtual mic, which nothing here
+        # hears, and pausing for it dropped what you said next (2026-11-24 Discord test)
+        audible = self.name == "them"
         while (item := self.voices.get()) is not None:
             pcm, rate = item
-            self.session.playing(+1, duck=self.name == "them")
+            if audible:
+                self.session.playing(+1, duck=True)
             try:
                 subprocess.run(["pacat", "--raw", f"--rate={rate}", "--channels=1", "--format=s16le",
                                 *self.play_to], input=pcm, stderr=subprocess.DEVNULL)
             finally:
-                self.session.playing(-1, duck=self.name == "them")
+                if audible:
+                    self.session.playing(-1, duck=True)
 
 
 class Interpreter:
@@ -152,6 +160,7 @@ class Interpreter:
         self.voices, self.quiet_until, self.ducker = 0, 0.0, None
         self.lock = threading.Lock()
         self.on_state = lambda on: None  # told True/False when it starts or stops; may be called from any thread
+        self.on_line = lambda lane, heard, english: None  # each sentence, for the subtitles; english "" if no change
 
     def their_language(self) -> str:
         return self.language.title() if self.language else "Chinese"

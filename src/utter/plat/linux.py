@@ -70,10 +70,14 @@ def _playing() -> dict:
         out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"], capture_output=True, text=True,
                              timeout=2).stdout
         streams = json.loads(out or "[]")
+        # the interpreter's call sink: what plays into it is being translated and must stay loud; its copy on the
+        # speakers (a loopback stream) is the one turned down
+        call = {line.split("\t")[0] for line in subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True,
+                text=True, timeout=2).stdout.splitlines() if "\tutter_call\t" in line + "\t"}
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return {}
     return {s["index"]: [int(c.get("value", 0)) for c in (s.get("volume") or {}).values()]
-            for s in streams if not s.get("corked")
+            for s in streams if not s.get("corked") and str(s.get("sink")) not in call
             and (s.get("properties") or {}).get("application.process.binary") not in ("paplay", "pacat")
             and s.get("volume")}  # pacat: the interpreter's translated voices
 

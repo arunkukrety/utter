@@ -32,6 +32,11 @@ CEREBRAS_CLEANUP_MODEL = os.environ.get("CEREBRAS_CLEANUP_MODEL", "qwen-3.8-27b"
 SURPLUS_KEY = os.environ.get("SURPLUS_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 CARTESIA_KEY = os.environ.get("CARTESIA_KEY", "")
+GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
+LIVE_TRANSLATE_MODEL = os.environ.get("LIVE_TRANSLATE_MODEL", "gemini-3.5-live-translate-preview")
+LIVE_TRANSLATE_USD_PER_MIN = float(os.environ.get("LIVE_TRANSLATE_USD_PER_MIN", "0.037"))  # Google's paid rate, est.
+GEMINI_LIVE_URL = ("wss://generativelanguage.googleapis.com/ws/"
+                   "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
 CARTESIA_STT_MODEL = os.environ.get("CARTESIA_STT_MODEL", "ink-whisper")  # Whisper-based; ~146 ms batch from here
 # AssemblyAI through OpenRouter: ~100 ms from here, billed per audio second with no minimum (measured 2026-11-14)
 OPENROUTER_STT_MODEL = os.environ.get("OPENROUTER_STT_MODEL", "assemblyai/universal-3-5-pro")
@@ -719,6 +724,70 @@ def interpret(ogg: bytes, to: str, lane: str) -> tuple:
     return {"heard": heard, "language": language, "text": text, "rate": INTERPRET_RATE}, pcm
 
 
+async def live_translate(ws, user: str, target: str) -> None:
+    """mode=live: the app streams 16 kHz PCM; Gemini Live Translate speaks it back in `target` as it goes. The app
+    gets the translated voice (binary, 24 kHz PCM) and JSON text frames {"heard", "language", "text", "done"}: pieces
+    of what was said and of its translation, "done" at the end of a turn. Speech already in `target` is not spoken
+    again (the app shows it). Google ends a session after about 10 minutes; the app then reconnects."""
+    import base64, websockets
+    seconds, billed = 0.0, 0.0
+    try:
+        async with websockets.connect(f"{GEMINI_LIVE_URL}?key={GEMINI_KEY}", max_size=None, open_timeout=10) as g:
+            await g.send(json.dumps({"setup": {
+                "model": f"models/{LIVE_TRANSLATE_MODEL}",
+                "generationConfig": {"responseModalities": ["AUDIO"],
+                                     "translationConfig": {"targetLanguageCode": target, "echoTargetLanguage": False}},
+                "inputAudioTranscription": {}, "outputAudioTranscription": {}}}))
+            await g.recv()  # setupComplete
+            await ws.send(json.dumps({"ready": True}))
+
+            async def up():
+                nonlocal seconds, billed
+                async for msg in ws:
+                    if not isinstance(msg, (bytes, bytearray)):
+                        continue
+                    seconds += len(msg) / 32000
+                    if seconds - billed >= 60:  # by the minute: the plan's limits, and the cost
+                        accounts.record_audio(user, seconds - billed)
+                        accounts.add_cost(user, "other", int((seconds - billed) / 60 * LIVE_TRANSLATE_USD_PER_MIN * 1e6))
+                        billed = seconds
+                        notice = accounts.blocked(user) or accounts.over_limit(user)
+                        if notice:
+                            await ws.send(json.dumps({"error": "not allowed", "notice": notice}))
+                            return
+                    await g.send(json.dumps({"realtimeInput": {"audio": {
+                        "data": base64.b64encode(msg).decode(), "mimeType": "audio/pcm;rate=16000"}}}))
+
+            async def down():
+                async for raw in g:
+                    sc = json.loads(raw).get("serverContent") or {}
+                    for part in (sc.get("modelTurn") or {}).get("parts", []):
+                        if "inlineData" in part:
+                            await ws.send(base64.b64decode(part["inlineData"]["data"]))
+                    out = {}
+                    if sc.get("inputTranscription"):
+                        out["heard"] = sc["inputTranscription"].get("text", "")
+                        out["language"] = sc["inputTranscription"].get("languageCode", "")
+                    if sc.get("outputTranscription"):
+                        out["text"] = sc["outputTranscription"].get("text", "")
+                    if sc.get("turnComplete") or sc.get("generationComplete") or sc.get("interrupted"):
+                        out["done"] = True
+                    if out:
+                        await ws.send(json.dumps(out))
+
+            tasks = [asyncio.create_task(up()), asyncio.create_task(down())]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in tasks:
+                t.cancel()
+    except Exception as exc:  # never str(exc) of the connect: it can carry the URL, and the URL carries the key
+        print(time.strftime("%H:%M:%S"), "live translate ended:", type(exc).__name__, flush=True)
+    finally:
+        if seconds > billed:
+            accounts.record_audio(user, seconds - billed)
+            accounts.add_cost(user, "other", int((seconds - billed) / 60 * LIVE_TRANSLATE_USD_PER_MIN * 1e6))
+        print(time.strftime("%H:%M:%S"), f"live translate -> {target}: {seconds:.0f} s of audio", flush=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep the app's connection open between dictations
 
@@ -892,12 +961,20 @@ async def stream_handler(ws, path=None):
     # mode=meeting: one minute of a meeting track -> its plain transcript (no cleanup). mode=notes: a meeting's
     # transcript -> notes. Both only on plans with meeting notes (Pro), and for the owner token.
     mode = q.get("mode", ["dictate"])[0]
-    if mode in ("meeting", "notes", "interpret"):
+    if mode in ("meeting", "notes", "interpret", "live"):
         notice = accounts.blocked(user) or (None if accounts.meetings_allowed(user) else
                                             "Meeting notes are part of the Pro plan.")
         if notice:
             await ws.send(json.dumps({"text": "", "error": "not allowed", "notice": notice}))
             return
+    if mode == "live":
+        notice = accounts.over_limit(user) or (None if GEMINI_KEY else "Live translation is not set up on the server.")
+        if notice:
+            await ws.send(json.dumps({"error": "not allowed", "notice": notice}))
+            return
+        start_dictation(user)
+        await live_translate(ws, user, re.sub(r"[^A-Za-z-]", "", q.get("to", ["en"])[0])[:12] or "en")
+        return
     if mode == "interpret":  # one connection per lane for the whole session: {"to", "lane"}, the audio, "end"; repeat
         _bill.set(lambda part, micro: accounts.add_cost(user, "other", micro))
         to, lane, audio = "English", "them", bytearray()

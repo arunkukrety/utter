@@ -53,6 +53,7 @@ Updated 2026-11-24. Done items move to the bottom.
 - Meeting notes (Linux): mic + system audio, speaker labels (Scribe via Surplus), notes by Gemini 4 Argon, Alt+M with
   the meeting pill.
 - App 1.0.8–1.0.11: short dictations no longer dropped, clear error messages, other audio fades down while dictating.
+- App 1.0.17: the interpreter hears the call through Gemini 3.5 Live Translate (server mode=live, GEMINI_KEY on the free tier for now): English voice and subtitles ~3 s in, while they are still talking.
 - App 1.0.16: live interpreter subtitles update every 0.8 s while someone talks, translated as they go.
 - App 1.0.13: the live interpreter (Alt+I): the call spoken to you in English, your voice spoken to them in their
   language through a virtual "Utter Microphone"; server mode=interpret (Whisper on Groq, fast-model race, ElevenLabs

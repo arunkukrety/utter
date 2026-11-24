@@ -17,6 +17,11 @@ Updated 2026-11-24. Done items move to the bottom.
 - [ ] **Privacy policy and terms** (simpler once meetings and dictations are no longer stored).
 
 ## Code
+- [ ] **Fix the UI of the meetings pill** (the "Meeting notes · 12:34" popup with the shiny border): what to change is
+      still to be listed.
+- [ ] **Rename the app:** "Utter" is too common. Shortlist: Bolo, Kaho, Sayso, Blurt, Lipi, Shabd, Typeless (check
+      domains and app-store names first). Touches the package and command names, the systemd service, the GNOME
+      shortcuts and the config folders (`~/.config/utter`, `~/.local/share/utter`), which need moving for existing users.
 - [ ] **Payment webhook** (Supabase Edge Function): the provider's events -> `apply_subscription()` (built and tested),
       plus an upgrade checkout link. Needs the provider decision.
 - [ ] **Website:** sign-up and login (Supabase Auth), keys (create, copy once, revoke), usage, plan and upgrade.

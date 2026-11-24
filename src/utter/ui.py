@@ -201,6 +201,7 @@ class MeetingPill(QWidget):
         self.font_.setPixelSize(13)
         # set by the tray: pause/resume, stop (and write the notes), the live levels, and a hook its icon follows
         self.on_pause = self.on_stop = lambda: None
+        self.hidden = False  # minimized to the tray for this meeting, or the pill is turned off in Settings
         self.on_change = lambda state: None
         self.levels = {"you": 0.0, "others": 0.0}
         self.mode, self.hover = "rec", None
@@ -212,7 +213,7 @@ class MeetingPill(QWidget):
         self.timer = QTimer(self, interval=16, timeout=self.tick)  # ~60 fps, only while shown
         self.state.connect(self.on_state)
         self.text_w = QFontMetrics(self.font_).horizontalAdvance("Meeting · 0:00:00")
-        self.resize(EDGE * 2 + PAD_X + 14 + GAP + self.text_w + GAP + WAVE * 5 + GAP + BUTTON * 2 + 8 + PAD_X - 4,
+        self.resize(EDGE * 2 + PAD_X + 14 + GAP + self.text_w + GAP + WAVE * 5 + GAP + BUTTON * 3 + 14 + PAD_X - 4,
                     EDGE * 2 + METER_H + PAD_Y * 2)
 
     # ---- state ----
@@ -221,10 +222,10 @@ class MeetingPill(QWidget):
         if state == "rec":
             self.mode, self.closing = "rec", None
             self.started, self.paused_at, self.paused_for = now, None, 0.0
-            self.wave, self.shown_at = [(0.0, False)] * WAVE, now
-            self.setWindowOpacity(0)
-            self.show()
-            self.timer.start()
+            self.wave = [(0.0, False)] * WAVE
+            self.hidden = read_settings().get("meeting_pill") is False
+            if not self.hidden:
+                self.appear()
         elif state == "paused":
             self.mode, self.paused_at = "paused", now
         elif state in ("resumed", "writing"):
@@ -233,9 +234,25 @@ class MeetingPill(QWidget):
             self.mode, self.paused_at = ("rec" if state == "resumed" else "writing"), None
         else:  # done: sink and fade out
             self.closing = now
+            self.hidden = False
         self.changed = now
         self.on_change(state)
         self.tick()
+
+    def appear(self) -> None:
+        self.shown_at, self.closing = time.monotonic(), None
+        self.setWindowOpacity(0)
+        self.show()
+        self.timer.start()
+
+    def minimize(self) -> None:
+        """Hide to the tray for the rest of this meeting: it sinks and fades out like at the end."""
+        self.hidden, self.closing = True, time.monotonic()
+
+    def restore(self) -> None:
+        if self.hidden and self.mode != "done":
+            self.hidden = False
+            self.appear()
 
     def clock(self) -> str:
         s = int((self.paused_at or time.monotonic()) - self.started - self.paused_for)
@@ -245,8 +262,9 @@ class MeetingPill(QWidget):
     def buttons(self) -> dict:
         box = QRectF(self.rect()).adjusted(EDGE, EDGE, -EDGE, -EDGE)
         y, right = box.center().y() - BUTTON / 2, box.right() - PAD_X + 4
-        return {"stop": QRectF(right - BUTTON, y, BUTTON, BUTTON),
-                "pause": QRectF(right - BUTTON * 2 - 6, y, BUTTON, BUTTON)}
+        return {"min": QRectF(right - BUTTON, y, BUTTON, BUTTON),
+                "stop": QRectF(right - BUTTON * 2 - 6, y, BUTTON, BUTTON),
+                "pause": QRectF(right - BUTTON * 3 - 12, y, BUTTON, BUTTON)}
 
     def hit(self, pos):
         if self.mode == "writing" or self.closing is not None:
@@ -266,6 +284,9 @@ class MeetingPill(QWidget):
             self.on_pause()
         elif name == "stop":
             self.on_stop()
+        elif name == "min":
+            self.minimize()
+            self.on_change("hidden")
 
     # ---- motion ----
     def place(self, offset: float) -> None:
@@ -349,6 +370,8 @@ class MeetingPill(QWidget):
             c = b.center()
             if name == "stop":
                 p.drawRoundedRect(QRectF(c.x() - 4, c.y() - 4, 8, 8), 1.5, 1.5)
+            elif name == "min":  # a bar low down: minimize to the tray
+                p.drawRoundedRect(QRectF(c.x() - 5, c.y() + 1.5, 10, 2.2), 1.1, 1.1)
             elif self.mode == "paused":  # play: resume
                 p.drawPolygon([QPointF(c.x() - 3, c.y() - 5), QPointF(c.x() + 5, c.y()), QPointF(c.x() - 3, c.y() + 5)])
             else:
@@ -663,6 +686,13 @@ class Window(QWidget):
             page.addLayout(level_row)
             add(dim("Only apps that are playing are turned down, and each goes back to its own volume the moment you "
                     "stop talking. Your system volume is not changed."))
+            add(title("Meeting notes"))
+            show_pill = QCheckBox("Show the meeting pill while recording")
+            show_pill.setChecked(cfg.get("meeting_pill") is not False)
+            show_pill.toggled.connect(lambda on: update_settings(meeting_pill=on))  # read when a meeting starts
+            add(show_pill)
+            add(dim("Off, a meeting shows only in the tray icon at the top. The pill's minimize button hides it for "
+                    "one meeting; \"Show meeting pill\" in the tray menu brings it back."))
 
         version = title(f"Utter {VERSION}")
         add(version)
@@ -860,12 +890,18 @@ def make_tray(window: Window) -> QSystemTrayIcon:
 
         pause = QAction("Pause meeting notes  (Alt+P)", menu)
         pause.setVisible(False)
+        shown = QAction("Hide meeting pill", menu)
+        shown.setVisible(False)
         icons = {s: QIcon(plat.resource("data", f"utter-tray{s}.svg")) for s in ("", "-meeting", "-paused")}
 
         def on_meeting() -> None:  # the menu item and Alt+M (`utter meeting`) both land here
             MEETING.toggle()
 
         def follow(state: str) -> None:  # the menu and the icon follow the meeting (on the UI thread, via the pill)
+            shown.setText("Show meeting pill" if pill.hidden else "Hide meeting pill")
+            shown.setVisible(MEETING.recording)
+            if state == "hidden":
+                return
             on = state in ("rec", "paused", "resumed")
             meeting.setText("Stop meeting notes  (Alt+M)" if on else "Start meeting notes  (Alt+M)")
             pause.setVisible(on)
@@ -877,10 +913,19 @@ def make_tray(window: Window) -> QSystemTrayIcon:
         meeting.setText("Start meeting notes  (Alt+M)")
         meeting.triggered.connect(on_meeting)
         pause.triggered.connect(MEETING.pause)
+        def on_shown() -> None:
+            if pill.hidden:
+                pill.restore()
+            else:
+                pill.minimize()
+            follow("hidden")
+
+        shown.triggered.connect(on_shown)
         pill.on_pause, pill.on_stop, pill.levels = MEETING.pause, on_meeting, MEETING.levels
         pill.on_change = follow
         menu.insertAction(menu.actions()[3], meeting)  # above Settings' separator, with the other actions
         menu.insertAction(menu.actions()[4], pause)
+        menu.insertAction(menu.actions()[5], shown)
         tray.toggle_meeting, tray.cancel_meeting, tray.pause_meeting = on_meeting, MEETING.cancel, MEETING.pause
         tray._meeting_pill = pill
     tray.setContextMenu(menu)

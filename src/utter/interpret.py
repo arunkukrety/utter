@@ -38,7 +38,8 @@ def cleanup() -> None:
     for line in _pactl("list", "short", "modules").splitlines():
         parts = line.split("\t")
         if len(parts) > 2 and any(f"{k}={v}" in parts[2] for k, v in (
-                ("sink_name", SINK), ("source_name", SOURCE), ("sink_name", CALL), ("source", CALL + ".monitor"))):
+                ("sink_name", SINK), ("source_name", SOURCE), ("sink_name", CALL), ("source", CALL + ".monitor"),
+                ("sink", SINK))):
             _pactl("unload-module", parts[0])
     for path, command in ((RESTORE, "set-default-source"), (RESTORE_OUT, "set-default-sink")):
         try:
@@ -220,18 +221,23 @@ class Lane:
 
 
 class LiveLane:
-    """Them -> you through Gemini Live Translate (server mode=live): the call's sound streams up as it plays, and the
-    English voice and words come back while they are still talking, about a second behind them. Speech already in
-    English is shown, not spoken again. The session is reopened when it ends (Google closes it every ~10 minutes)."""
-    name = "them"
+    """One direction through Gemini Live Translate (server mode=live): the sound streams up as it is spoken and the
+    translated voice and words come back while the speaker is still talking, about a second behind. Speech already in
+    the target language is shown, not spoken again. The session is reopened when it ends (Google closes it every ~10
+    minutes) and, for your lane, when they switch language.
+      them: the call (utter_call) -> English on your speakers; the call is turned down under it.
+      me:   your mic -> their language, into Utter Microphone. Your own voice always goes there too, by a loopback
+            that needs no server; it is turned down to a murmur while the translation speaks."""
+    MURMUR = 0.15  # your own voice under your translated one, like an interpreter's booth
 
-    def __init__(self, session, device: str, speakers: str) -> None:
-        self.session, self.device, self.speakers = session, device, speakers
+    def __init__(self, session, name: str, device: str, out: str, target, voice_module: str = "") -> None:
+        self.session, self.name, self.device, self.out, self.target = session, name, device, out, target
+        self.voice_module = voice_module  # me: the loopback carrying your own voice, turned down under the translation
         self.running, self.proc, self.ws = False, None, None
 
     def start(self) -> None:
         self.running = True
-        threading.Thread(target=self._run, name="interpret-live", daemon=True).start()
+        threading.Thread(target=self._run, name=f"interpret-live-{self.name}", daemon=True).start()
 
     def stop(self) -> None:
         self.running = False
@@ -247,7 +253,7 @@ class LiveLane:
                 self._session()
             except Exception as exc:
                 if self.running:
-                    core.LOG(f"interpret live: {type(exc).__name__} {str(exc)[:100]}")
+                    core.LOG(f"interpret live {self.name}: {type(exc).__name__} {str(exc)[:100]}")
             finally:
                 if self.proc:
                     self.proc.terminate()
@@ -261,8 +267,25 @@ class LiveLane:
         except Exception:
             pass
 
+    def _own_voice(self, level: float) -> None:
+        """Turn the loopback carrying your own voice to the call up (1.0) or down (MURMUR)."""
+        try:
+            streams = json.loads(_pactl("-f", "json", "list", "sink-inputs") or "[]")
+        except ValueError:
+            return
+        for s in streams:
+            if str(s.get("owner_module")) == self.voice_module:
+                _pactl("set-sink-input-volume", str(s["index"]), f"{int(level * 100)}%")
+
+    def _speaking(self, on: bool) -> None:
+        if self.name == "them":
+            self.session.playing(+1 if on else -1, duck=True)
+        elif self.voice_module:
+            self._own_voice(self.MURMUR if on else 1.0)
+
     def _session(self) -> None:
-        url = (core.setting("server_url") or core.SERVER_URL) + "?mode=live&to=en"
+        target = self.target()
+        url = (core.setting("server_url") or core.SERVER_URL) + f"?mode=live&to={target}"
         self.ws = ws = websockets.sync.client.connect(url, max_size=None, open_timeout=10, additional_headers={
             "Authorization": f"Bearer {core.read_token()}"})
         with ws:
@@ -275,24 +298,27 @@ class LiveLane:
                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             threading.Thread(target=self._feed, args=(ws, self.proc), daemon=True).start()
             player = subprocess.Popen(["pacat", "--raw", "--rate=24000", "--channels=1", "--format=s16le",
-                                       f"--device={self.speakers}", "--latency-msec=60"], stdin=subprocess.PIPE,
+                                       f"--device={self.out}", "--latency-msec=60"], stdin=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL)
             heard = text = ""
-            speaking, last_voice, last_heard, english = False, 0.0, 0.0, False
+            speaking, last_voice, last_heard, same = False, 0.0, 0.0, False
             try:
                 while self.running:
+                    if self.target() != target:  # they switched language: a new session in theirs
+                        core.LOG(f"interpret live {self.name}: now into {self.target()}")
+                        return
                     try:
                         msg = ws.recv(timeout=0.3)
                     except TimeoutError:
                         msg = None
-                    if speaking and time.monotonic() - last_voice > 0.6:  # its voice has stopped: the call comes back up
+                    if speaking and time.monotonic() - last_voice > 0.6:  # the translated voice has stopped
                         speaking = False
-                        self.session.playing(-1, duck=True)
-                    # a pause of a second, and the English has caught up: the line is finished
+                        self._speaking(False)
+                    # a pause of a second, and the translation has caught up: the line is finished
                     if (msg is None and heard.strip() and time.monotonic() - last_heard > 1.0
-                            and heard.rstrip()[-1:] in ENDS and (english or text.rstrip()[-1:] in ENDS)):
-                        self.session.on_line("them", heard.strip(), text.strip(), False)
-                        core.LOG(f"interpret live: {heard.strip()} -> {text.strip()}")
+                            and heard.rstrip()[-1:] in ENDS and (same or text.rstrip()[-1:] in ENDS)):
+                        self.session.on_line(self.name, heard.strip(), text.strip(), False)
+                        core.LOG(f"interpret live {self.name}: {heard.strip()} -> {text.strip()}")
                         heard = text = ""
                     if msg is None:
                         continue
@@ -300,7 +326,7 @@ class LiveLane:
                         if _level(msg) > 200:  # Google streams silence too: only real speech counts as its voice
                             if not speaking:
                                 speaking = True
-                                self.session.playing(+1, duck=True)
+                                self._speaking(True)
                             last_voice = time.monotonic()
                         player.stdin.write(msg)
                         player.stdin.flush()
@@ -315,19 +341,19 @@ class LiveLane:
                     text += m.get("text", "")
                     if m.get("language"):
                         code = m["language"].split("-")[0].lower()
-                        english = code == "en"  # nothing to translate: the line ends with what they said
-                        self.session.heard_language(LANGUAGES.get(code, code))
-                    # a line ends with the turn, or once both what they said and its English end a sentence
+                        same = code == target  # nothing to translate: the line ends with what was said
+                        if self.name == "them":
+                            self.session.heard_code(code)
                     done = m.get("done") or len(heard) > 240 and heard.rstrip()[-1:] in ENDS
                     if heard.strip() or text.strip():
-                        self.session.on_line("them", heard.strip(), text.strip(), not done)
+                        self.session.on_line(self.name, heard.strip(), text.strip(), not done)
                     if done:
                         if heard.strip():
-                            core.LOG(f"interpret live: {heard.strip()} -> {text.strip()}")
+                            core.LOG(f"interpret live {self.name}: {heard.strip()} -> {text.strip()}")
                         heard = text = ""
             finally:
                 if speaking:
-                    self.session.playing(-1, duck=True)
+                    self._speaking(False)
                 player.stdin.close()
                 player.terminate()
 
@@ -336,6 +362,7 @@ class Interpreter:
     def __init__(self) -> None:
         self.lanes, self.on = [], False
         self.language = ""  # what they have been speaking, as Whisper names it
+        self.code = "en"  # and as a language code, for the live lanes: your voice goes out in this
         self.voices, self.quiet_until, self.ducker = 0, 0.0, None
         self.lock = threading.Lock()
         self.on_state = lambda on: None  # told True/False when it starts or stops; may be called from any thread
@@ -351,6 +378,12 @@ class Interpreter:
         if target and target != self.language:
             self.language = target
             core.LOG(f"interpret: they speak {language}; your voice goes out in {self.their_language()}")
+
+    def heard_code(self, code: str) -> None:
+        """The live lane heard them speak `code`: your voice goes to them in it (English for Hindi, as above)."""
+        code = {"cmn": "zh", "yue": "zh"}.get(code, code)  # Gemini's target takes the plain code
+        self.code = "en" if code in ("en", "hi") else code
+        self.heard_language(LANGUAGES.get(code, code))
 
     def voice_playing(self) -> bool:
         return self.voices > 0 or time.monotonic() < self.quiet_until
@@ -368,6 +401,7 @@ class Interpreter:
 
     def start(self) -> None:
         cleanup()
+        self.language, self.code = "", "en"  # until they speak, you are passed on as you are (and Hindi in English)
         mic = _pactl("get-default-source")
         from .plat import linux
         chosen = linux._mic_args(core.setting("mic"))  # the mic chosen in Settings, else the default as it was
@@ -390,10 +424,13 @@ class Interpreter:
             with open(RESTORE_OUT, "w") as f:
                 f.write(speakers)
             _pactl("set-default-sink", CALL)
-            them = LiveLane(self, f"{CALL}.monitor", speakers)
+            # your own voice goes to the call by a loopback that needs no server; the translation joins it there
+            voice = _pactl("load-module", "module-loopback", f"source={own}", f"sink={SINK}", "latency_msec=30",
+                           "source_dont_move=true", "sink_dont_move=true")
+            self.lanes = [LiveLane(self, "them", f"{CALL}.monitor", speakers, lambda: "en"),
+                          LiveLane(self, "me", own, SINK, lambda: self.code, voice_module=voice)]
         else:
-            them = Lane(self, "them", "@DEFAULT_MONITOR@", [])
-        self.lanes = [them, Lane(self, "me", own, [f"--device={SINK}"])]
+            self.lanes = [Lane(self, "them", "@DEFAULT_MONITOR@", []), Lane(self, "me", own, [f"--device={SINK}"])]
         for lane in self.lanes:
             lane.start()
         self.on = True

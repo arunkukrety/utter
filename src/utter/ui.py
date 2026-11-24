@@ -8,7 +8,7 @@ It never takes focus, or the pasted text would land in the pill instead of the a
 """
 import json, math, os, sys, threading, time, urllib.error, urllib.request
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication,
                            QIcon, QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
@@ -855,6 +855,11 @@ class Window(QWidget):
 
 
 # ---- tray icon ------------------------------------------------------------------------------------------------------
+class Relay(QObject):
+    """Carries a call from any thread onto the UI thread."""
+    fired = Signal(bool)
+
+
 def meeting_icon(mode: str, frame: int) -> QIcon:
     """The tray icon during a meeting: a small pill like the meeting pill. Recording: a red dot that blinks; writing
     the notes: three dots lighting up in turn; paused: grey with a pause sign."""
@@ -968,6 +973,17 @@ def make_tray(window: Window) -> QSystemTrayIcon:
         menu.insertAction(menu.actions()[3], meeting)  # above Settings' separator, with the other actions
         menu.insertAction(menu.actions()[4], pause)
         menu.insertAction(menu.actions()[5], shown)
+        # the interpreter: its own item; on_state can come from any thread, so it hops to this one through a signal
+        from .interpret import INTERPRETER, cleanup
+        cleanup()  # a crash while it was on left the virtual mic behind: take it away, give the user's own back
+        interpreter = QAction("Start interpreter  (Alt+I)", menu)
+        relay = Relay(menu)
+        relay.fired.connect(lambda on: interpreter.setText(("Stop" if on else "Start") + " interpreter  (Alt+I)"))
+        INTERPRETER.on_state = relay.fired.emit
+        interpreter.triggered.connect(INTERPRETER.toggle)
+        menu.insertAction(menu.actions()[6], interpreter)
+        tray._relay = relay
+        tray.toggle_interpreter = INTERPRETER.toggle
         tray.toggle_meeting, tray.cancel_meeting, tray.pause_meeting = on_meeting, MEETING.cancel, MEETING.pause
         tray._meeting_pill = pill
     tray.setContextMenu(menu)

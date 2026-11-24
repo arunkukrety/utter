@@ -2,7 +2,8 @@
 
 Linux: run by the systemd user service `utter`; the `utter` command (bin/utter) and the hold-to-talk helper send it
 signals: SIGUSR1 starts/stops a dictation, SIGRTMIN cancels one, SIGHUP re-reads the API key, SIGUSR2 opens the window,
-SIGRTMIN+1 starts/stops meeting notes (Alt+M), SIGRTMIN+2 pauses/resumes them (Alt+P). SIGRTMIN (Alt+X, `utter cancel`) also cancels meeting notes.
+SIGRTMIN+1 starts/stops meeting notes (Alt+M), SIGRTMIN+2 pauses/resumes them (Alt+P), SIGRTMIN+3 turns the
+interpreter on or off (Alt+I). SIGRTMIN (Alt+X, `utter cancel`) also cancels meeting notes.
 macOS / Windows: the hotkeys live in the app. One copy runs; opening the app again shows its window instead.
 `--background` (used by start at login) starts it without opening the window.
 """
@@ -18,6 +19,7 @@ if LINUX:
     signal.signal(signal.SIGRTMIN, lambda *_: EARLY.append("cancel"))
     signal.signal(signal.SIGRTMIN + 1, signal.SIG_IGN)  # Alt+M before the tray exists: ignored, never fatal
     signal.signal(signal.SIGRTMIN + 2, signal.SIG_IGN)
+    signal.signal(signal.SIGRTMIN + 3, signal.SIG_IGN)
     signal.signal(signal.SIGUSR2, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
@@ -103,6 +105,9 @@ def main() -> None:
     elif "--background" not in sys.argv:
         window.open("history")
     code = app.exec()
+    if LINUX:  # the interpreter's virtual microphone goes, and the user's own comes back
+        from .interpret import INTERPRETER
+        INTERPRETER.stop()
     # Leave at once: a normal interpreter shutdown tears Qt down while the engine thread is still running, which
     # segfaults. History and settings are written as they happen, so only the log needs flushing.
     sys.stdout.flush()
@@ -134,6 +139,7 @@ def _linux_signals(app, window, core, tray) -> None:
     signal.signal(signal.SIGUSR2, lambda *_: window.open("history"))
     signal.signal(signal.SIGRTMIN + 1, lambda *_: tray.toggle_meeting())  # Alt+M: `utter meeting`
     signal.signal(signal.SIGRTMIN + 2, lambda *_: tray.pause_meeting())  # Alt+P: `utter pause`
+    signal.signal(signal.SIGRTMIN + 3, lambda *_: tray.toggle_interpreter())  # Alt+I: `utter interpret`
     signal.signal(signal.SIGTERM, lambda *_: app.quit())
     for kind in EARLY:
         core.press() if kind == "press" else core.cancel()

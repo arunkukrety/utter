@@ -626,6 +626,82 @@ def _race(msgs: list, words: int, racers: tuple, first_slot: int = 1) -> str:
     raise RuntimeError("both failed: " + "; ".join(errors))
 
 
+# ---- the interpreter: one spoken sentence -> what was said, in which language, translated, and spoken ----------------
+INTERPRET_TTS_MODEL = os.environ.get("INTERPRET_TTS_MODEL", "eleven_flash_v2_5")  # ~75 ms, 32 languages
+INTERPRET_VOICES = {"them": os.environ.get("INTERPRET_VOICE_THEM", "EXAVITQu4vr4xnSDxMaL"),  # what they say, to you
+                    "me": os.environ.get("INTERPRET_VOICE_ME", "JBFqnCBsd6RMkjVDRZzb")}  # what you say, to them
+INTERPRET_RATE = 24000  # the voice comes back as raw 16-bit mono PCM at this rate
+
+
+def hear(ogg: bytes) -> tuple:
+    """A sentence -> (its text, its language as Whisper names it: "chinese", "english", ...). Whisper's own signs of
+    nothing said (silence, a cough) give ("", "")."""
+    t0 = time.monotonic()
+    g = "utter" + secrets.token_hex(8)
+    fields = {"model": GROQ_STT_MODEL, "response_format": "verbose_json", "temperature": "0"}
+    body = b"".join(f"--{g}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+                    for k, v in fields.items())
+    body += (f"--{g}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"s.ogg\"\r\n"
+             f"Content-Type: audio/ogg\r\n\r\n").encode() + ogg + f"\r\n--{g}--\r\n".encode()
+    status, data = call("api.groq.com", "POST", "/openai/v1/audio/transcriptions", body,
+                        {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": f"multipart/form-data; boundary={g}"})
+    if status != 200:
+        log_call("interpret_stt", GROQ_STT_MODEL, "groq", t0, status, error=data[:300].decode(errors="replace"))
+        raise RuntimeError(f"stt HTTP {status}")
+    reply = json.loads(data)
+    log_call("interpret_stt", GROQ_STT_MODEL, "groq", t0, status, reply)
+    segs = reply.get("segments") or []
+    if not segs or all(x.get("no_speech_prob", 0) > 0.6 or x.get("compression_ratio", 0) > 2.4 for x in segs):
+        return "", ""
+    return reply.get("text", "").strip(), (reply.get("language") or "").lower()
+
+
+def translate(text: str, to: str) -> str:
+    msgs = [{"role": "system", "content": f"You are a live interpreter. Translate the user's message into {to}. Reply "
+                                          f"with the translation only: no notes, no quotes. Keep names as they are. If "
+                                          f"it is already in {to}, reply with it unchanged."},
+            {"role": "user", "content": text}]
+    return _race(msgs, len(text.split()) * 3, DIRECT_RACERS)
+
+
+def speak(text: str, lane: str) -> bytes:
+    """ElevenLabs Flash through the Surplus key market -> raw PCM at INTERPRET_RATE."""
+    t0 = time.monotonic()
+    c = http.client.HTTPSConnection("api.surplusintelligence.ai", timeout=TIMEOUT_S)  # its own: we need the headers
+    try:
+        # the /stream route: its first audio comes back in ~0.55 s every time, the plain one swung 0.45-1.7 s (2026-11-24)
+        c.request("POST", f"/v1/resources/elevenlabs/v1/text-to-speech/{INTERPRET_VOICES[lane]}/stream"
+                          f"?output_format=pcm_{INTERPRET_RATE}",
+                  json.dumps({"text": text, "model_id": INTERPRET_TTS_MODEL}).encode(),
+                  {"xi-api-key": SURPLUS_KEY, "Content-Type": "application/json"})
+        r = c.getresponse()
+        data = r.read()
+        cost = int(r.getheader("x-si-buyer-cost-micro") or 0)
+    finally:
+        c.close()
+    if r.status != 200:
+        log_call("interpret_tts", INTERPRET_TTS_MODEL, "surplus", t0, r.status, error=data[:300].decode(errors="replace"))
+        raise RuntimeError(f"tts HTTP {r.status}")
+    charge(cost / 1_000_000, "other")
+    log_call("interpret_tts", INTERPRET_TTS_MODEL, "surplus", t0, r.status, cost_micro=cost)
+    return data
+
+
+def interpret(ogg: bytes, to: str, lane: str) -> tuple:
+    """-> (reply for the app, the translated voice as PCM or b"")."""
+    t = time.monotonic()
+    heard, language = hear(ogg)
+    if not heard:
+        return {"heard": "", "language": "", "text": ""}, b""
+    t_stt = time.monotonic()
+    text = translate(heard, to)
+    t_tr = time.monotonic()
+    pcm = speak(text, lane) if text else b""
+    print(time.strftime("%H:%M:%S"), f"interpret {lane}: {language} -> {to}: stt {(t_stt - t) * 1000:.0f} ms, "
+          f"translate {(t_tr - t_stt) * 1000:.0f} ms, voice {(time.monotonic() - t_tr) * 1000:.0f} ms", flush=True)
+    return {"heard": heard, "language": language, "text": text, "rate": INTERPRET_RATE}, pcm
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep the app's connection open between dictations
 
@@ -799,12 +875,45 @@ async def stream_handler(ws, path=None):
     # mode=meeting: one minute of a meeting track -> its plain transcript (no cleanup). mode=notes: a meeting's
     # transcript -> notes. Both only on plans with meeting notes (Pro), and for the owner token.
     mode = q.get("mode", ["dictate"])[0]
-    if mode in ("meeting", "notes"):
+    if mode in ("meeting", "notes", "interpret"):
         notice = accounts.blocked(user) or (None if accounts.meetings_allowed(user) else
                                             "Meeting notes are part of the Pro plan.")
         if notice:
             await ws.send(json.dumps({"text": "", "error": "not allowed", "notice": notice}))
             return
+    if mode == "interpret":  # one connection per lane for the whole session: {"to", "lane"}, the audio, "end"; repeat
+        _bill.set(lambda part, micro: accounts.add_cost(user, "other", micro))
+        to, lane, audio = "English", "them", bytearray()
+        try:
+            async for msg in ws:
+                if isinstance(msg, (bytes, bytearray)):
+                    audio.extend(msg)
+                    if len(audio) > MAX_AUDIO:
+                        await ws.close(code=4413, reason="too much audio")
+                        return
+                elif msg == "end":
+                    notice = accounts.blocked(user) or accounts.over_limit(user)
+                    if notice:
+                        await ws.send(json.dumps({"error": "not allowed", "notice": notice}))
+                        return
+                    start_dictation(user)
+                    try:
+                        reply, pcm = await asyncio.to_thread(interpret, bytes(audio), to, lane)
+                    except Exception as exc:
+                        print(time.strftime("%H:%M:%S"), "interpret failed:", str(exc)[:200], flush=True)
+                        reply, pcm = {"error": "interpret failed"}, b""
+                    accounts.record_audio(user, accounts.audio_seconds(bytes(audio), "ogg"))
+                    audio = bytearray()
+                    await ws.send(json.dumps({**reply, "audio": len(pcm)}))
+                    if pcm:
+                        await ws.send(pcm)
+                else:
+                    req = json.loads(msg)
+                    to = str(req.get("to") or to)[:40]
+                    lane = req.get("lane") if req.get("lane") in INTERPRET_VOICES else lane
+        except Exception:
+            return  # the app closed the session
+        return
     if mode == "notes":
         try:
             req = json.loads(await ws.recv())

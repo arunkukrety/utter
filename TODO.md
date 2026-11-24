@@ -32,14 +32,9 @@ Updated 2026-11-24. Done items move to the bottom.
 - [ ] Retention for saved dictations — only if saving stays on.
 
 ## Later
-- [ ] **Real-time meeting translator** (Arun, 2026-11-24): in a call where someone speaks, say, Chinese, you hear them
-      in your language, and they hear you in theirs. Two live pipelines, each speech -> text -> translate -> speech:
-      - Theirs -> you: the call's audio (the same monitor source meeting notes record) is transcribed in chunks,
-        translated, spoken back to you over the call's sound turned down (the volume fade already exists).
-      - You -> them: your mic, translated and spoken into a virtual mic (a PipeWire null sink + its monitor as a
-        source) that you pick as the microphone in Zoom/Meet/Teams.
-      - The hard part is delay: aim for ~1-2 s, so streaming STT plus sentence-sized chunks, a fast translation model
-        and a streaming TTS voice; check speech-to-speech models too, which skip the text step. Linux first.
+- [ ] **Interpreter, next steps** (v1 is built, 1.0.13): stream the voice so it starts sooner; live subtitles; a
+      voice picker and your own cloned voice; echo cancelling so speakers work without headphones; pick their language by
+      hand; an on-screen indicator; Mac and Windows. Ideas from github.com/wquguru/cicada (Apache-2.0, Python Linux app).
 - [ ] Mac and Windows: meeting capture (ScreenCaptureKit / WASAPI loopback) and the volume fades.
 - [ ] Keyterms for meetings (names like "SKD"), about $0.01/hour through Surplus.
 - [ ] Per-app audio capture for meetings, so notification sounds and other apps stay out.
@@ -58,6 +53,9 @@ Updated 2026-11-24. Done items move to the bottom.
 - Meeting notes (Linux): mic + system audio, speaker labels (Scribe via Surplus), notes by Gemini 4 Argon, Alt+M with
   the meeting pill.
 - App 1.0.8–1.0.11: short dictations no longer dropped, clear error messages, other audio fades down while dictating.
+- App 1.0.13: the live interpreter (Alt+I): the call spoken to you in English, your voice spoken to them in their
+  language through a virtual "Utter Microphone"; server mode=interpret (Whisper on Groq, fast-model race, ElevenLabs
+  Flash via Surplus, ~1.2 s a sentence after its pause).
 - App 1.0.12: the meeting pill animates (rises in, breathing glow, red-dot ripple, grey when paused, dots while
   writing, sinks out) and has a pause button; Alt+P pauses/resumes a meeting, Alt+X cancels a dictation or meeting;
   the tray icon changes while a meeting is on or paused; notes are copied, no longer opened in an editor.

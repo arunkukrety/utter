@@ -65,7 +65,7 @@ def play(path: str) -> None:
 
 
 def _playing() -> dict:
-    """{stream index: [volume per channel]} for every app playing now (not paused), Utter's own beeps left out."""
+    """{stream index: [volume per channel]} for every app playing now (not paused), Utter's own sounds left out."""
     try:
         out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"], capture_output=True, text=True,
                              timeout=2).stdout
@@ -74,7 +74,8 @@ def _playing() -> dict:
         return {}
     return {s["index"]: [int(c.get("value", 0)) for c in (s.get("volume") or {}).values()]
             for s in streams if not s.get("corked")
-            and (s.get("properties") or {}).get("application.process.binary") != "paplay" and s.get("volume")}
+            and (s.get("properties") or {}).get("application.process.binary") not in ("paplay", "pacat")
+            and s.get("volume")}  # pacat: the interpreter's translated voices
 
 
 def _set_volume(index: int, volumes: list) -> None:
@@ -249,6 +250,8 @@ EXTRA_KEYS = [("meeting_hotkey_checked", "<Alt>m", "meeting", "Utter: start or s
                "Press Alt+M to start meeting notes, and again to stop."),
               ("pause_hotkey_checked", "<Alt>p", "pause", "Utter: pause or resume meeting notes",
                "Press Alt+P to pause meeting notes, and again to resume."),
+              ("interpret_hotkey_checked", "<Alt>i", "interpret", "Utter: interpreter on or off",
+               "Press Alt+I to turn the live interpreter on, and again to turn it off."),
               ("cancel_hotkey_checked", "<Alt>x", "cancel", "Utter: cancel dictation or meeting notes",
                "Press Alt+X to cancel a dictation or meeting notes.")]
 

@@ -16,7 +16,7 @@ Standard library only. Listens on 127.0.0.1; a Cloudflare tunnel puts HTTPS in f
 from the environment (systemd EnvironmentFile), never from the request. Provider connections are kept open and reused,
 so a request pays no handshake to ElevenLabs or Groq.
 """
-import re, asyncio, contextvars, hashlib, http.client, json, os, secrets, subprocess, threading, time
+import re, asyncio, contextvars, hashlib, http.client, json, os, secrets, subprocess, threading, time, unicodedata
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -258,8 +258,16 @@ def unclear(raw) -> bool:
     """Too unsure to paste: low confidence on 3 words or more. One- and two-word dictations always paste: the
     transcriber scores very short clips low even when they are right ("Hey man." 0.50, on 60 real dictations, while
     the one rubbish sentence scored 0.61 and every real sentence 0.77 or more, 2026-11-24)."""
+    if foreign_script(str(raw)):
+        return True
     conf = getattr(raw, "confidence", None)
     return conf is not None and conf < UNCLEAR_BELOW and len(str(raw).split()) >= 3
+
+
+def foreign_script(text: str) -> bool:
+    """Letters in a script Utter never asks for (only English and Hindi): Whisper guessing the language of a near-silent
+    clip writes a made-up word in Chinese or Korean ("有。", "比如。" on 2026-11-24). Always wrong, however short."""
+    return any(c.isalpha() and not unicodedata.name(c, "").startswith(("LATIN", "DEVANAGARI")) for c in text)
 
 
 def transcribe(mp3: bytes, language: str, route: str = "direct", fmt: str = "mp3", stt_model: str = "",

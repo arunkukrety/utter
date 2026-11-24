@@ -17,8 +17,6 @@ Updated 2026-11-24. Done items move to the bottom.
 - [ ] **Privacy policy and terms** (simpler once meetings and dictations are no longer stored).
 
 ## Code
-- [ ] **Fix the UI of the meetings pill** (the "Meeting notes · 12:34" popup with the shiny border): what to change is
-      still to be listed.
 - [ ] **Rename the app:** "Utter" is too common. Shortlist: Bolo, Kaho, Sayso, Blurt, Lipi, Shabd, Typeless (check
       domains and app-store names first). Touches the package and command names, the systemd service, the GNOME
       shortcuts and the config folders (`~/.config/utter`, `~/.local/share/utter`), which need moving for existing users.
@@ -52,3 +50,5 @@ Updated 2026-11-24. Done items move to the bottom.
 - Meeting notes (Linux): mic + system audio, speaker labels (Scribe via Surplus), notes by Gemini 4 Argon, Alt+M with
   the meeting pill.
 - App 1.0.8–1.0.11: short dictations no longer dropped, clear error messages, other audio fades down while dictating.
+- App 1.0.12: the meeting pill animates (rises in, breathing glow, red-dot ripple, grey when paused, dots while
+  writing, sinks out); Alt+X pauses and resumes a dictation or meeting; notes are copied, no longer opened in an editor.

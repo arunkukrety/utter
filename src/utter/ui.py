@@ -54,7 +54,7 @@ class Pill(QWidget):
         self.font_.setPixelSize(13)
         self.note = ""
         self.history, self.bars = [], [0.0] * BARS
-        self.start, self.closing, self.processing, self.message = 0.0, None, None, False
+        self.start, self.closing, self.processing, self.message, self.paused = 0.0, None, None, False, False
         self.timer = QTimer(self, interval=16, timeout=self.tick)  # ~60 fps, only while visible
         self.message_timer = QTimer(self, singleShot=True, timeout=self.end_message)
         self.line.connect(self.handle)  # emitted from the engine's thread, run on this one
@@ -79,7 +79,12 @@ class Pill(QWidget):
         r = self.height() / 2
         p.drawRoundedRect(QRectF(self.rect()), r, r)
         p.translate(PAD_X, PAD_Y)
-        if self.message:  # a short notice ("Didn't catch that"): a calm grey dot beside the text
+        if self.paused:  # Alt+X: grey dot and a pause sign
+            self.dot(p, QColor(161, 161, 171, 230))
+            p.setBrush(QColor(245, 245, 245, 230))
+            for x in (24, 31):
+                p.drawRoundedRect(QRectF(x, 4, 3.5, 14), 1.5, 1.5)
+        elif self.message:  # a short notice ("Didn't catch that"): a calm grey dot beside the text
             self.dot(p, QColor(161, 161, 171, 230))
         elif self.processing is not None:  # waiting for the final text: grey dot and three dots rising in a wave
             self.dot(p, QColor(161, 161, 171, 230))
@@ -128,7 +133,7 @@ class Pill(QWidget):
 
     def show_pill(self) -> None:
         self.history, self.bars = [], [0.0] * BARS
-        self.start, self.closing, self.processing, self.message = time.monotonic(), None, None, False
+        self.start, self.closing, self.processing, self.message, self.paused = time.monotonic(), None, None, False, False
         self.note = ""
         self.fit()
         self.setWindowOpacity(0)
@@ -159,9 +164,13 @@ class Pill(QWidget):
             if self.visible() and self.closing is None:
                 self.processing = time.monotonic()
                 self.set_note("Reconnecting…")
-        elif line == "A":  # reconnected: back to the listening bars
-            self.processing = None
+        elif line == "A":  # reconnected, or resumed: back to the listening bars
+            self.processing, self.paused = None, False
             self.set_note("")
+        elif line == "Z":  # paused (Alt+X)
+            if self.visible() and self.closing is None:
+                self.processing, self.paused = None, True
+                self.set_note("Paused · Alt+X to resume")
         elif line == "P":  # stopped listening, waiting for the final text
             if self.visible() and self.closing is None:
                 self.processing = time.monotonic()
@@ -181,10 +190,11 @@ SHINE = [(0.0, "#a78bfa"), (0.33, "#22d3ee"), (0.66, "#f472b6"), (1.0, "#a78bfa"
 
 
 class MeetingPill(QWidget):
-    """Shown for the whole of a meeting recording, just above where the dictation pill appears: a slowly turning
-    violet-cyan-pink border with a soft glow sets it apart from dictation, a pulsing red dot and the time recorded so
-    far. After the stop it says "Writing notes…" until they are ready."""
-    state = Signal(str)  # "rec", "writing", "done": from the meeting's own thread, run on this one
+    """Shown for the whole of a meeting recording, just above where the dictation pill appears. It rises and fades in
+    like the dictation pill, with a turning violet-cyan-pink border whose glow breathes, a pulsing red dot and the time
+    recorded so far. Paused (Alt+X), the border fades to grey and stops; after the stop the border speeds up while
+    three dots ripple beside "Writing meeting notes", then it sinks and fades out."""
+    state = Signal(str)  # "rec", "paused", "resumed", "writing", "done": from the meeting's thread, run on this one
 
     def __init__(self) -> None:
         flags = Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
@@ -195,70 +205,124 @@ class MeetingPill(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.font_ = QFont()
         self.font_.setPixelSize(13)
-        self.started, self.writing, self.text = 0.0, False, ""
-        self.timer = QTimer(self, interval=33, timeout=self.tick)  # ~30 fps, only while shown
+        self.mode, self.text = "rec", ""
+        self.shown_at, self.closing, self.changed = 0.0, None, 0.0  # changed: when the last mode change happened
+        self.started, self.paused_at, self.paused_for = 0.0, None, 0.0
+        self.turn, self.last = 0.0, 0.0  # the border's angle, advanced each frame so speed changes never jump
+        self.grey = 0.0  # 0 = full colour, 1 = paused grey; eased toward its goal each frame
+        self.timer = QTimer(self, interval=16, timeout=self.tick)  # ~60 fps, only while shown
         self.state.connect(self.on_state)
+        fm = QFontMetrics(self.font_)
+        self.resize(GLOW * 2 + PAD_X * 2 + 30 + GAP + max(fm.horizontalAdvance(t) for t in (
+            "Meeting notes · 0:00:00", "Writing meeting notes", "Paused · 0:00:00 · Alt+X")),
+            GLOW * 2 + METER_H + PAD_Y * 2)
 
     def on_state(self, state: str) -> None:
+        now = time.monotonic()
         if state == "rec":
-            self.started, self.writing = time.monotonic(), False
-            self.setWindowOpacity(1.0)
+            self.mode, self.closing, self.grey = "rec", None, 0.0
+            self.started, self.paused_at, self.paused_for = now, None, 0.0
+            self.shown_at = self.last = now
+            self.setWindowOpacity(0)
             self.show()
             self.timer.start()
+        elif state == "paused":
+            self.mode, self.paused_at = "paused", now
+        elif state == "resumed":
+            if self.paused_at is not None:
+                self.paused_for += now - self.paused_at
+            self.mode, self.paused_at = "rec", None
         elif state == "writing":
-            self.writing = True
-        else:  # done
-            self.timer.stop()
-            self.hide()
+            if self.paused_at is not None:
+                self.paused_for += now - self.paused_at
+            self.mode, self.paused_at = "writing", None
+        else:  # done: sink and fade out
+            self.closing = now
+        self.changed = now
         self.tick()
 
-    def tick(self) -> None:
-        if self.writing:
-            self.text = "Writing meeting notes…"
-        else:
-            s = int(time.monotonic() - self.started)
-            self.text = f"Meeting notes · {s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else \
-                f"Meeting notes · {s // 60}:{s % 60:02d}"
-        fm = QFontMetrics(self.font_)
-        w = GLOW * 2 + PAD_X * 2 + 14 + GAP + max(fm.horizontalAdvance(t) for t in
-                                                 ("Meeting notes · 0:00:00", "Writing meeting notes…"))
-        h = GLOW * 2 + METER_H + PAD_Y * 2
-        if self.size().width() != w or self.size().height() != h:
-            self.resize(w, h)
+    def elapsed(self) -> int:
+        now = self.paused_at or time.monotonic()
+        return int(now - self.started - self.paused_for)
+
+    def place(self, offset: float) -> None:
         area = QGuiApplication.primaryScreen().availableGeometry()
         dictation_pill = METER_H + PAD_Y * 2
-        self.move(area.x() + (area.width() - w) // 2,
-                  area.y() + area.height() - BOTTOM_GAP - dictation_pill - 10 - h + GLOW)
+        self.move(area.x() + (area.width() - self.width()) // 2,
+                  int(area.y() + area.height() - BOTTOM_GAP - dictation_pill - 10 - self.height() + GLOW + offset))
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        dt, self.last = min(0.1, now - self.last), now
+        speed = {"rec": 90, "paused": 0, "writing": 240}[self.mode]  # degrees a second: one turn per 4 s, 1.5 s writing
+        self.turn = (self.turn + speed * dt) % 360
+        self.grey += ((1.0 if self.mode == "paused" else 0.0) - self.grey) * min(1.0, dt * 8)
+        s = self.elapsed()
+        clock = f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+        self.text = {"rec": f"Meeting notes · {clock}", "paused": f"Paused · {clock} · Alt+X",
+                     "writing": "Writing meeting notes"}[self.mode]
+        if self.closing is None:
+            t = min(1.0, (now - self.shown_at) * 1000 / IN_MS)
+            self.setWindowOpacity(ease_out(t))
+            self.place(SLIDE_PX * (1 - ease_out(t)))
+        else:
+            t = min(1.0, (now - self.closing) * 1000 / (OUT_MS * 1.5))
+            self.setWindowOpacity(1 - t)
+            self.place(SLIDE_PX * 0.5 * t)
+            if t >= 1.0:
+                self.timer.stop()
+                self.hide()
+                return
         self.update()
+
+    def colour(self, hex_: str, alpha: int = 255) -> QColor:
+        """A border colour, blended toward grey as the pill pauses."""
+        c, g = QColor(hex_), self.grey
+        return QColor(int(c.red() + (113 - c.red()) * g), int(c.green() + (113 - c.green()) * g),
+                      int(c.blue() + (122 - c.blue()) * g), alpha)
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        now = time.monotonic()
         box = QRectF(self.rect()).adjusted(GLOW, GLOW, -GLOW, -GLOW)
         r = box.height() / 2
-        turn = (time.monotonic() * 90) % 360  # one turn every 4 s
-        shine = QConicalGradient(box.center(), turn)
-        for at, color in SHINE:
-            shine.setColorAt(at, QColor(color))
-        for width, alpha in ((GLOW * 2, 40), (GLOW, 70)):  # the soft glow, widest and faintest first
-            glow = QConicalGradient(shine)
+        breathe = 0.5 + 0.5 * math.sin(now * 2.2) if self.mode != "paused" else 0.0  # the glow swells and settles
+        for width, alpha in ((GLOW * 2, 25 + 35 * breathe), (GLOW, 55 + 45 * breathe)):  # widest and faintest first
+            glow = QConicalGradient(box.center(), self.turn)
             for at, color in SHINE:
-                c = QColor(color)
-                c.setAlpha(alpha)
-                glow.setColorAt(at, c)
+                glow.setColorAt(at, self.colour(color, int(alpha * (1 - 0.6 * self.grey))))
             p.setPen(QPen(glow, width))
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(box, r, r)
+        shine = QConicalGradient(box.center(), self.turn)
+        for at, color in SHINE:
+            shine.setColorAt(at, self.colour(color))
         p.setPen(QPen(shine, 2))
         p.setBrush(QColor(24, 24, 27, 240))
         p.drawRoundedRect(box, r, r)
         p.setPen(Qt.NoPen)
-        pulse = 0.55 + 0.45 * math.sin(time.monotonic() * 3)  # the dot breathes while recording
-        p.setBrush(QColor(161, 161, 171) if self.writing else QColor(240, 69, 69, int(255 * pulse)))
-        p.drawEllipse(QPointF(box.x() + PAD_X + 5, box.center().y()), 4.5, 4.5)
-        p.setPen(QColor("#f4f4f5"))
+        x, y = box.x() + PAD_X, box.center().y()
+        since = now - self.changed
+        if self.mode == "writing":  # three dots rising in a wave, as the dictation pill does while it waits
+            for i in range(3):
+                lift = max(0.0, math.sin(since * 6.0 - i * 0.7))
+                p.setBrush(QColor(245, 245, 245, int(255 * (0.45 + 0.55 * lift))))
+                p.drawEllipse(QPointF(x + 4 + i * 9, y - 4 * lift + 1), 2.4, 2.4)
+        elif self.mode == "paused":  # a pause sign
+            p.setBrush(QColor(212, 212, 216))
+            for dx in (1, 8):
+                p.drawRoundedRect(QRectF(x + dx, y - 7, 3.5, 14), 1.5, 1.5)
+        else:  # the red dot breathes, with a ring that ripples out from it every 1.6 s
+            pulse = 0.55 + 0.45 * math.sin(now * 3)
+            ripple = (now % 1.6) / 1.6
+            p.setBrush(QColor(240, 69, 69, int(90 * (1 - ripple))))
+            p.drawEllipse(QPointF(x + 9, y), 4.5 + 6 * ripple, 4.5 + 6 * ripple)
+            p.setBrush(QColor(240, 69, 69, int(255 * pulse)))
+            p.drawEllipse(QPointF(x + 9, y), 4.5, 4.5)
+        p.setPen(QColor(244, 244, 245, int(255 * min(1.0, 0.3 + since * 4))))  # new text fades in on a mode change
         p.setFont(self.font_)
-        p.drawText(box.adjusted(PAD_X + 14 + GAP, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self.text)
+        p.drawText(box.adjusted(PAD_X + 30 + GAP - 10, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self.text)
 
 
 # ---- settings and keys on disk --------------------------------------------------------------------------------------
@@ -769,7 +833,7 @@ def make_tray(window: Window) -> QSystemTrayIcon:
         meeting.setText("Start meeting notes  (Alt+M)")
         meeting.triggered.connect(on_meeting)
         menu.insertAction(menu.actions()[3], meeting)  # above Settings' separator, with the other actions
-        tray.toggle_meeting, tray._meeting_pill = on_meeting, pill
+        tray.toggle_meeting, tray.pause_meeting, tray._meeting_pill = on_meeting, MEETING.pause, pill
     tray.setContextMenu(menu)
     if sys.platform == "win32":  # a left click on Windows opens the window; the menu is on the right click
         tray.activated.connect(lambda reason: reason == QSystemTrayIcon.Trigger and window.open("history"))

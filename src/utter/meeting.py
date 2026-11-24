@@ -4,8 +4,10 @@ Two tracks are recorded side by side: your mic ("You") and what your speakers pl
 the default output). Each is encoded to Opus and cut into one-minute files on disk while the meeting runs, so a crash
 loses at most a minute. When you stop, each track is joined into parts of up to 25 minutes and transcribed by the
 Utter server (mode=meeting: ElevenLabs Scribe through the Surplus key market, with speaker labels on the others' track),
-the lines are merged by their real timestamps, and the server writes notes from that (mode=notes). Transcript and notes are saved as Markdown in DATA/meetings/<when>/ and the notes are opened; the audio
-is deleted once the notes exist. The server allows this only on plans with meeting notes (Pro) and for the owner key.
+the lines are merged by their real timestamps, and the server writes notes from that (mode=notes). Transcript and notes
+are saved as Markdown in DATA/meetings/<when>/ and the notes are copied to the clipboard; the audio is deleted once the
+notes exist. Alt+X pauses and resumes: each stretch of recording is its own "part" (p0, p1, ...) with its start time, so
+the transcript's clock stays right across pauses. The server allows this only on plans with meeting notes (Pro) and for the owner key.
 
 Headphones work best: on speakers your mic also hears the others, and their words then show up under "You" too.
 """
@@ -35,20 +37,29 @@ def _join(paths: list) -> bytes:
 
 class Meeting:
     def __init__(self) -> None:
-        self.dir, self.started, self.procs = None, None, []
-        # told "rec" (recording), "writing" (stopped, notes on their way) and "done"; may be called from any thread
+        self.dir, self.started, self.procs, self.parts = None, None, [], []  # parts: each stretch's start, s from started
+        self.paused = False
+        # told "rec", "paused", "resumed", "writing" (stopped, notes on their way) and "done"; called from any thread
         self.on_state = lambda state: None
 
     @property
     def recording(self) -> bool:
-        return bool(self.procs)
+        return bool(self.procs) or self.paused
 
     def start(self) -> None:
-        self.started = time.time()
+        self.started, self.parts, self.paused = time.time(), [], False
         self.dir = os.path.join(core.DATA, "meetings", time.strftime("%Y-%m-%d %H%M", time.localtime(self.started)))
         os.makedirs(self.dir, exist_ok=True)
         os.chmod(self.dir, 0o700)
+        self._record()
+        core.LOG(f"meeting: recording to {self.dir}")
+        self.on_state("rec")
+
+    def _record(self) -> None:
+        """Start the two recorders for a new part."""
         from .plat import linux
+        part = len(self.parts)
+        self.parts.append(time.time() - self.started)
         mic = linux._mic_args(core.setting("mic"))  # the mic chosen in Settings, else the default
         for track, device in (("you", mic), ("others", ["--device=@DEFAULT_MONITOR@"])):
             rec = subprocess.Popen(["parecord", "--raw", f"--rate={core.RATE}", "--channels=1", "--format=s16le",
@@ -56,15 +67,12 @@ class Meeting:
             enc = subprocess.Popen([core.FFMPEG, "-v", "error", "-f", "s16le", "-ar", str(core.RATE), "-ac", "1",
                                     "-i", "pipe:0", "-c:a", "libopus", "-b:a", "16k", "-application", "voip",
                                     "-f", "segment", "-segment_time", str(SEGMENT_S), "-segment_format", "ogg",
-                                    "-reset_timestamps", "1", os.path.join(self.dir, f"{track}-%04d.ogg")],
+                                    "-reset_timestamps", "1", os.path.join(self.dir, f"{track}-p{part}-%04d.ogg")],
                                    stdin=rec.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             rec.stdout.close()  # the encoder owns the pipe now
             self.procs += [rec, enc]
-        core.LOG(f"meeting: recording to {self.dir}")
-        self.on_state("rec")
 
-    def stop(self) -> None:
-        """Stop recording and write the notes in the background."""
+    def _end_part(self) -> None:
         for p in self.procs[::2]:  # the recorders; each encoder then finishes its last file and exits
             p.terminate()
         for p in self.procs[1::2]:
@@ -73,12 +81,31 @@ class Meeting:
             except subprocess.TimeoutExpired:
                 p.kill()
         self.procs = []
-        folder, started = self.dir, self.started
+
+    def pause(self) -> None:
+        """Alt+X: pause or resume the recording."""
+        if not self.recording:
+            return
+        if self.paused:
+            self.paused = False
+            self._record()
+            self.on_state("resumed")
+        else:
+            self._end_part()
+            self.paused = True
+            self.on_state("paused")
+        core.LOG(f"meeting: {'paused' if self.paused else 'resumed'}")
+
+    def stop(self) -> None:
+        """Stop recording and write the notes in the background."""
+        self._end_part()
+        self.paused = False
+        folder, started, parts = self.dir, self.started, self.parts
         self.on_state("writing")
 
         def finish() -> None:
             try:
-                asyncio.run(_finish(folder, started))
+                asyncio.run(_finish(folder, started, parts))
             finally:
                 self.on_state("done")
 
@@ -103,7 +130,7 @@ async def _ask(url: str, token: str, first, timeout: float) -> dict:
         return json.loads(await asyncio.wait_for(ws.recv(), timeout))
 
 
-async def _finish(folder: str, started: float) -> None:
+async def _finish(folder: str, started: float, parts: list) -> None:
     try:
         base = core.setting("server_url") or core.SERVER_URL
         language = "multi" if core.setting("language") == "multi" else "en"
@@ -114,8 +141,9 @@ async def _finish(folder: str, started: float) -> None:
         gate = asyncio.Semaphore(PARALLEL)
 
         async def one(track: str, index: int, minutes: list):
-            """One part (up to PART_MINUTES one-minute files) of one track, joined, -> (start offset s, track, segments)."""
-            offset = int(re.search(r"-(\d+)\.ogg$", minutes[0]).group(1)) * SEGMENT_S
+            """Up to PART_MINUTES one-minute files of one track and part, joined, -> (start offset s, track, segments)."""
+            part, first = (int(n) for n in re.search(r"-p(\d+)-(\d+)\.ogg$", minutes[0]).groups())
+            offset = parts[part] + first * SEGMENT_S
             audio = _join(minutes)
             if len(audio) < 2000:  # nothing recorded
                 return offset, track, []
@@ -139,9 +167,10 @@ async def _finish(folder: str, started: float) -> None:
 
         jobs = []
         for track in TRACKS:
-            minutes = sorted(f for f in files if os.path.basename(f).startswith(track + "-"))
-            for i in range(0, len(minutes), PART_MINUTES):
-                jobs.append(one(track, i // PART_MINUTES, minutes[i:i + PART_MINUTES]))
+            for part in range(len(parts)):  # never joined across a pause: the gap would shift every later timestamp
+                minutes = sorted(f for f in files if os.path.basename(f).startswith(f"{track}-p{part}-"))
+                for i in range(0, len(minutes), PART_MINUTES):
+                    jobs.append(one(track, len(jobs), minutes[i:i + PART_MINUTES]))
         lines, duration = [], 0.0
         for offset, track, segs in await asyncio.gather(*jobs):
             for s in segs:
@@ -171,8 +200,8 @@ async def _finish(folder: str, started: float) -> None:
         for path in files:  # the notes exist: the recording is no longer needed
             os.remove(path)
         core.LOG(f"meeting: notes written ({len(lines)} transcript lines) to {notes_path}")
-        core.notify("Meeting notes are ready.")
-        subprocess.Popen(["xdg-open", notes_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        core.plat.copy(reply["notes"])
+        core.notify("Meeting notes are ready and copied. Paste them anywhere.")
     except PermissionError as exc:
         core.notify(str(exc))
         core.LOG(f"meeting: refused ({exc}); the recording stays in {folder}")

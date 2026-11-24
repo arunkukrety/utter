@@ -244,30 +244,35 @@ def _is_utter(command: str) -> bool:
     return bool(command) and len(command.split()) == 1 and os.path.basename(command.split()[0]) == "utter"
 
 
-MEETING_HOTKEY = "<Alt>m"
-MEETING_KEY_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/utter-meeting/"
+# the extra shortcuts, each bound once per user on GNOME: (setting, key, `utter` argument, name, first-run notice)
+EXTRA_KEYS = [("meeting_hotkey_checked", "<Alt>m", "meeting", "Utter: start or stop meeting notes",
+               "Press Alt+M to start meeting notes, and again to stop."),
+              ("pause_hotkey_checked", "<Alt>x", "pause", "Utter: pause or resume",
+               "Press Alt+X to pause a dictation or meeting notes, and again to resume.")]
 
 
-def _bind_meeting_key() -> None:
-    """Once per user on GNOME: Alt+M runs `utter meeting` (start or stop meeting notes), unless Alt+M is taken."""
-    if _setting("meeting_hotkey_checked"):
-        return
-    entries, command = _entries(), _command()
-    if entries is None or command == "utter":
-        return  # not GNOME, or no installed command to bind: try again next start
-    taken = next((n or c for _p, b, c, n in entries if b.lower() == MEETING_HOTKEY.lower()
-                  and c.split()[-1:] != ["meeting"]), None)
-    if taken:
-        notify(f"Alt+M is already used by {taken}. Bind any key to 'utter meeting' in Settings > Keyboard.")
-    elif not any(p == MEETING_KEY_PATH for p, *_ in entries):
-        node = f"{GNOME_KEYS}.custom-keybinding:{MEETING_KEY_PATH}"
-        _gset("set", node, "name", "Utter: start or stop meeting notes")
-        _gset("set", node, "command", f"{command} meeting")
-        _gset("set", node, "binding", MEETING_HOTKEY)
-        _gset("set", GNOME_KEYS, "custom-keybindings", str([e[0] for e in entries] + [MEETING_KEY_PATH]))
-        notify("Press Alt+M to start meeting notes, and again to stop.")
-        LOG("bound Alt+M")
-    _save_setting("meeting_hotkey_checked", True)
+def _bind_extra_keys() -> None:
+    """Bind each extra shortcut to `utter <argument>` once, unless its key is taken."""
+    for flag, key, arg, name, notice in EXTRA_KEYS:
+        if _setting(flag):
+            continue
+        entries, command = _entries(), _command()
+        if entries is None or command == "utter":
+            return  # not GNOME, or no installed command to bind: try again next start
+        path = f"/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/utter-{arg}/"
+        label = key.replace("<Alt>", "Alt+").upper().replace("ALT", "Alt")
+        taken = next((n or c for _p, b, c, n in entries if b.lower() == key.lower() and c.split()[-1:] != [arg]), None)
+        if taken:
+            notify(f"{label} is already used by {taken}. Bind any key to 'utter {arg}' in Settings > Keyboard.")
+        elif not any(p == path for p, *_ in entries):
+            node = f"{GNOME_KEYS}.custom-keybinding:{path}"
+            _gset("set", node, "name", name)
+            _gset("set", node, "command", f"{command} {arg}")
+            _gset("set", node, "binding", key)
+            _gset("set", GNOME_KEYS, "custom-keybindings", str([e[0] for e in entries] + [path]))
+            notify(notice)
+            LOG(f"bound {label}")
+        _save_setting(flag, True)
 
 
 def _entries():
@@ -315,9 +320,10 @@ def set_shortcut(combo: str) -> str:
 
 def start_keys(on_press, on_cancel) -> None:
     """Presses arrive as signals (wired in __main__). First run on GNOME: bind Alt+D to `utter`, unless Utter already
-    has a shortcut or Alt+D is taken. Runs once per user; change it later in Settings. Alt+M (meeting notes) likewise."""
+    has a shortcut or Alt+D is taken. Runs once per user; change it later in Settings. Alt+M (meeting notes) and Alt+X
+    (pause) likewise."""
     try:
-        _bind_meeting_key()
+        _bind_extra_keys()
     except (OSError, ValueError, SyntaxError, subprocess.TimeoutExpired) as exc:
         LOG(f"could not set up the meeting shortcut: {exc}")
     if _setting("hotkey_checked"):

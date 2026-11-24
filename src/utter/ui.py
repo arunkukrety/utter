@@ -10,7 +10,7 @@ import json, math, os, sys, threading, time, urllib.error, urllib.request
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontMetrics, QGuiApplication,
-                           QIcon, QPainter, QPen)
+                           QIcon, QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QMenu, QPushButton, QRadioButton, QScrollArea, QStackedWidget,
                                QSystemTrayIcon, QVBoxLayout, QWidget)
@@ -855,6 +855,35 @@ class Window(QWidget):
 
 
 # ---- tray icon ------------------------------------------------------------------------------------------------------
+def meeting_icon(mode: str, frame: int) -> QIcon:
+    """The tray icon during a meeting: a small pill like the meeting pill. Recording: a red dot that blinks; writing
+    the notes: three dots lighting up in turn; paused: grey with a pause sign."""
+    pix = QPixmap(44, 44)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(QColor("#71717a") if mode == "paused" else VIOLET, 3.4))
+    p.setBrush(QColor("#18181b"))
+    p.drawRoundedRect(QRectF(2.5, 8.5, 39, 27), 13.5, 13.5)
+    p.setPen(Qt.NoPen)
+    if mode == "paused":
+        p.setBrush(QColor("#e4e4e7"))
+        for x in (16, 23.5):
+            p.drawRoundedRect(QRectF(x, 15, 4.5, 14), 2, 2)
+    elif mode == "writing":
+        for i in range(3):
+            p.setBrush(QColor(244, 244, 245, 255 if frame % 3 == i else 90))
+            p.drawEllipse(QPointF(13 + i * 9, 22), 3.2, 3.2)
+    else:
+        p.setBrush(QColor(239, 68, 68, 255 if frame % 2 == 0 else 70))
+        p.drawEllipse(QPointF(14, 22), 5, 5)
+        p.setBrush(QColor("#f4f4f5"))
+        p.drawRoundedRect(QRectF(23, 17, 3.6, 10), 1.8, 1.8)
+        p.drawRoundedRect(QRectF(29.5, 14, 3.6, 16), 1.8, 1.8)
+    p.end()
+    return QIcon(pix)
+
+
 def make_tray(window: Window) -> QSystemTrayIcon:
     icon = QIcon(plat.resource("data", "utter.svg" if sys.platform == "win32" else "utter-tray.svg"))
     if MAC:
@@ -892,7 +921,15 @@ def make_tray(window: Window) -> QSystemTrayIcon:
         pause.setVisible(False)
         shown = QAction("Hide meeting pill", menu)
         shown.setVisible(False)
-        icons = {s: QIcon(plat.resource("data", f"utter-tray{s}.svg")) for s in ("", "-meeting", "-paused")}
+        normal = tray.icon()
+        look = {"mode": None, "frame": 0}  # "rec", "paused", "writing" or None (the normal icon)
+        blink = QTimer(tray, interval=450)  # animates the icon while recording or writing, so a hidden pill still shows it
+
+        def animate() -> None:
+            look["frame"] += 1
+            tray.setIcon(meeting_icon(look["mode"], look["frame"]))
+
+        blink.timeout.connect(animate)
 
         def on_meeting() -> None:  # the menu item and Alt+M (`utter meeting`) both land here
             MEETING.toggle()
@@ -906,9 +943,14 @@ def make_tray(window: Window) -> QSystemTrayIcon:
             meeting.setText("Stop meeting notes  (Alt+M)" if on else "Start meeting notes  (Alt+M)")
             pause.setVisible(on)
             pause.setText(("Resume" if state == "paused" else "Pause") + " meeting notes  (Alt+P)")
-            tray.setIcon(icons["-paused" if state == "paused" else "-meeting" if on else ""])
-            tray.setToolTip("Utter: meeting paused" if state == "paused" else
-                            "Utter: recording meeting notes" if on else "Utter")
+            look["mode"] = {"rec": "rec", "resumed": "rec", "paused": "paused", "writing": "writing"}.get(state)
+            if look["mode"] in ("rec", "writing"):
+                blink.start()
+            else:
+                blink.stop()
+            tray.setIcon(meeting_icon(look["mode"], 0) if look["mode"] else normal)
+            tray.setToolTip({"rec": "Utter: recording meeting notes", "paused": "Utter: meeting paused",
+                             "writing": "Utter: writing meeting notes…"}.get(look["mode"], "Utter"))
 
         meeting.setText("Start meeting notes  (Alt+M)")
         meeting.triggered.connect(on_meeting)

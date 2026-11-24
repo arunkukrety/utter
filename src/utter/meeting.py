@@ -11,7 +11,7 @@ the transcript's clock stays right across pauses. The server allows this only on
 
 Headphones work best: on speakers your mic also hears the others, and their words then show up under "You" too.
 """
-import asyncio, glob, json, os, re, shutil, subprocess, threading, time
+import array, asyncio, glob, math, json, os, re, shutil, subprocess, threading, time
 
 import websockets
 
@@ -39,6 +39,7 @@ class Meeting:
     def __init__(self) -> None:
         self.dir, self.started, self.procs, self.parts = None, None, [], []  # parts: each stretch's start, s from started
         self.paused = False
+        self.levels = {"you": 0.0, "others": 0.0}  # each track's loudness right now, 0..1, for the pill
         # told "rec", "paused", "resumed", "writing" (stopped, notes on their way) and "done"; called from any thread
         self.on_state = lambda state: None
 
@@ -68,9 +69,26 @@ class Meeting:
                                     "-i", "pipe:0", "-c:a", "libopus", "-b:a", "16k", "-application", "voip",
                                     "-f", "segment", "-segment_time", str(SEGMENT_S), "-segment_format", "ogg",
                                     "-reset_timestamps", "1", os.path.join(self.dir, f"{track}-p{part}-%04d.ogg")],
-                                   stdin=rec.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            rec.stdout.close()  # the encoder owns the pipe now
+                                   stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            threading.Thread(target=self._pump, args=(track, rec, enc), name=f"meeting-{track}", daemon=True).start()
             self.procs += [rec, enc]
+
+    def _pump(self, track: str, rec, enc) -> None:
+        """Recorder -> encoder, measuring the level on the way for the pill's bars. Ends when the recorder stops."""
+        try:
+            while chunk := rec.stdout.read(1600):  # 50 ms
+                enc.stdin.write(chunk)
+                samples = array.array("h", chunk[:len(chunk) // 2 * 2])
+                rms = math.sqrt(sum(x * x for x in samples) / max(1, len(samples)))
+                self.levels[track] = max(0.0, min(1.0, (20 * math.log10(rms + 1) - 32) / 40))  # ~32 dB room..72 loud
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.levels[track] = 0.0
+            try:
+                enc.stdin.close()  # the encoder then finishes its last file and exits
+            except OSError:
+                pass
 
     def _end_part(self) -> None:
         for p in self.procs[::2]:  # the recorders; each encoder then finishes its last file and exits

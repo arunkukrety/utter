@@ -385,10 +385,35 @@ def clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     if len(text.split()) < 3:  # "Yes.", "Thank you." — nothing to clean, so no cleanup call (its cost and ~0.25 s)
         return text
     try:
-        return _clean(text, provider, roman)
+        out = TAGS.sub("", _clean(text, provider, roman)).strip()
     except Exception as exc:
         print(time.strftime("%H:%M:%S"), f"cleanup ({provider}) failed, sending the raw transcript: {str(exc)[:150]}", flush=True)
         return text
+    if looks_like_answer(text, out):
+        print(time.strftime("%H:%M:%S"), f"cleanup ({provider}) answered instead of cleaning; sending the raw transcript", flush=True)
+        return text
+    return out
+
+
+TAGS = re.compile(r"</?transcript>")
+_WORD = re.compile(r"[a-z0-9']+")
+
+
+def looks_like_answer(raw: str, out: str) -> bool:
+    """True when the cleaned text is not the dictation any more: mostly new words, or far longer. Cleanup only drops,
+    fixes and reorders, so a reply that is mostly words the speaker never said is the model talking to them ("I'm sorry,
+    I can't", "Sure, here's an example"). Latin-script dictations only: Devanagari romanised to Roman letters is new
+    words by design."""
+    if not out:
+        return True
+    if re.search(r"[ऀ-ॿ؀-ۿ]", raw):
+        return False
+    said, wrote = _WORD.findall(raw.lower()), _WORD.findall(out.lower())
+    if not wrote:
+        return False
+    new = sum(w not in set(said) for w in wrote) / len(wrote)
+    # ponytail: word-overlap heuristic; tune 0.5 / 1.5x if real cleanups trip it (the log line above counts them)
+    return new > 0.5 or len(wrote) > 1.5 * len(said) + 8
 
 
 URDU_SCRIPT = re.compile(r"[\u0600-\u06ff]")  # AssemblyAI with no language hint sometimes writes spoken Hindi as Urdu
@@ -400,7 +425,8 @@ def _clean(text: str, provider: str = "groq", roman: bool = False) -> str:
     if URDU_SCRIPT.search(text):  # the general prompt rule alone was ignored on short sentences; say it for this one
         prompt += ("\nThis text is Hindi that the transcriber wrote in Urdu script. Write it in "
                    + ("Roman letters" if roman else "Devanagari") + ", same words.")
-    msgs = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
+    # tagged so a dictated instruction ("show me an example") reads as text to clean, not a request to the model
+    msgs = [{"role": "system", "content": prompt}, {"role": "user", "content": f"<transcript>\n{text}\n</transcript>"}]
     if provider == "race":
         return _race(msgs, len(text.split()), DIRECT_RACERS)
     if provider in ("orrace", "orslot1", "orslot2"):  # both cleanup_models racing, or one of them alone (the cost cap)
